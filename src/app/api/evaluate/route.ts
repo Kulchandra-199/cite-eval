@@ -9,9 +9,41 @@ function isAbortError(error: unknown): boolean {
   );
 }
 
+async function readRequestPayload(request: Request) {
+  if (request.signal.aborted) {
+    return null;
+  }
+
+  const raw = await request.text();
+  if (!raw.trim()) {
+    return null;
+  }
+
+  return JSON.parse(raw) as {
+    facts?: unknown;
+    evaluator?: string;
+    stream?: boolean;
+  };
+}
+
 export async function POST(request: Request) {
   try {
-    const { facts, evaluator, stream } = await request.json();
+    let payload: Awaited<ReturnType<typeof readRequestPayload>>;
+    try {
+      payload = await readRequestPayload(request);
+    } catch {
+      return NextResponse.json(
+        { error: { code: "unknown", message: "Request body must be valid JSON." } },
+        { status: 400 },
+      );
+    }
+
+    if (!payload) {
+      // Client aborted or disconnected before the body arrived — not a Groq failure.
+      return new Response(null, { status: 499 });
+    }
+
+    const { facts, evaluator, stream } = payload;
 
     if (!facts || !Array.isArray(facts)) {
       return NextResponse.json(

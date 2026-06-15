@@ -18,11 +18,16 @@ import {
   applyFactToReport,
   buildPlaceholderFacts,
   computeReportCounts,
+  countErrorFacts,
+  countNotSureFacts,
+  factsToInputPayload,
   finalizeReportStatus,
 } from "@/lib/report-utils";
 
 const REPORTS_KEY = "CITATION_EVAL_REPORTS";
 const DEFAULT_EVALUATOR_KEY = "CITATE_EVAL_DEFAULT_EVALUATOR";
+const ACTIVE_EVAL_KEY = "CITATION_ACTIVE_EVALUATION";
+const PENDING_EVAL_KEY = "CITATION_PENDING_EVALUATION";
 
 export interface EvalLogEntry {
   id: string;
@@ -75,6 +80,7 @@ interface ReportsContextValue {
   activeEvaluation: ActiveEvaluation | null;
   pauseEvaluation: () => void;
   resumeEvaluation: () => void;
+  resumeInterruptedReport: (reportId: string) => void;
   registerEvalAbort: (abort: (() => void) | null) => void;
   syncEvaluatedFact: (
     reportId: string,
@@ -121,6 +127,164 @@ function loadReports(): Report[] {
   return [];
 }
 
+function buildActiveEvaluationFromReport(
+  report: Report,
+  options?: { resumeAfterReload?: boolean },
+): ActiveEvaluation | null {
+  const counts = computeReportCounts(report.facts);
+  if (report.status !== "PROCESSING" || counts.pendingCount === 0) {
+    return null;
+  }
+
+  const inputFacts = factsToInputPayload(report.facts);
+  const resumeAfterReload = options?.resumeAfterReload ?? false;
+
+  return {
+    reportId: report.id,
+    name: report.name,
+    evaluator: report.evaluator,
+    inputFacts,
+    fromIndex: counts.evaluatedCount,
+    currentIndex: counts.evaluatedCount,
+    isRunning: true,
+    isPaused: false,
+    isComplete: false,
+    isWaitingForFirst: counts.evaluatedCount === 0,
+    fatalError: null,
+    statusLine: resumeAfterReload
+      ? `Resuming after reload — ${counts.pendingCount} claim(s) remaining...`
+      : `Resuming interrupted evaluation — ${counts.pendingCount} claim(s) remaining...`,
+    logs: resumeAfterReload
+      ? [
+          {
+            id: `reload-resume-${Date.now()}`,
+            type: "info" as const,
+            text: `▶ Resumed after page reload — ${counts.pendingCount} claim(s) remaining.`,
+          },
+        ]
+      : [],
+    passedCount: report.passedCount,
+    failedCount: report.failedCount,
+    notSureCount: countNotSureFacts(report.facts),
+    errorCount: countErrorFacts(report.facts),
+  };
+}
+
+function restoreActiveEvaluation(reports: Report[]): ActiveEvaluation | null {
+  if (typeof window === "undefined") return null;
+
+  try {
+    const stored = localStorage.getItem(ACTIVE_EVAL_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored) as ActiveEvaluation;
+      const report = reports.find((r) => r.id === parsed.reportId);
+      if (!report) {
+        localStorage.removeItem(ACTIVE_EVAL_KEY);
+        localStorage.removeItem(PENDING_EVAL_KEY);
+      } else if (parsed.isComplete || parsed.fatalError || parsed.isPaused) {
+        return {
+          ...parsed,
+          evaluator: normalizeEvaluatorId(parsed.evaluator),
+        };
+      } else {
+        const currentIndex = Math.max(
+          parsed.currentIndex,
+          computeReportCounts(report.facts).evaluatedCount,
+        );
+        if (currentIndex >= parsed.inputFacts.length) {
+          return {
+            ...parsed,
+            evaluator: normalizeEvaluatorId(parsed.evaluator),
+            currentIndex: parsed.inputFacts.length,
+            isRunning: false,
+            isComplete: true,
+            isPaused: false,
+            isWaitingForFirst: false,
+            statusLine: `All ${parsed.inputFacts.length} claims processed.`,
+          };
+        }
+
+        const remaining = parsed.inputFacts.length - currentIndex;
+        return {
+          ...parsed,
+          evaluator: normalizeEvaluatorId(parsed.evaluator),
+          currentIndex,
+          fromIndex: currentIndex,
+          isRunning: true,
+          isPaused: false,
+          isWaitingForFirst: false,
+          statusLine: `Resuming after reload — ${remaining} claim(s) remaining...`,
+          logs: [
+            {
+              id: `reload-resume-${Date.now()}`,
+              type: "info" as const,
+              text: `▶ Resumed after page reload — ${remaining} claim(s) remaining.`,
+            },
+            ...parsed.logs,
+          ].slice(0, 30),
+          passedCount: report.passedCount,
+          failedCount: report.failedCount,
+          notSureCount: countNotSureFacts(report.facts),
+          errorCount: countErrorFacts(report.facts),
+        };
+      }
+    }
+  } catch {
+    localStorage.removeItem(ACTIVE_EVAL_KEY);
+  }
+
+  const processingReport = reports.find((r) => r.status === "PROCESSING");
+  if (processingReport) {
+    return buildActiveEvaluationFromReport(processingReport);
+  }
+
+  return null;
+}
+
+function restorePendingEvaluation(
+  active: ActiveEvaluation | null,
+): PendingEvaluation | null {
+  if (!active || active.isComplete) return null;
+  if (typeof window === "undefined") return null;
+
+  try {
+    const stored = localStorage.getItem(PENDING_EVAL_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored) as PendingEvaluation;
+      if (parsed.reportId === active.reportId) {
+        return parsed;
+      }
+    }
+  } catch {
+    localStorage.removeItem(PENDING_EVAL_KEY);
+  }
+
+  return {
+    name: active.name,
+    evaluator: active.evaluator,
+    facts: active.inputFacts,
+    reportId: active.reportId,
+  };
+}
+
+function persistActiveEvaluation(active: ActiveEvaluation | null) {
+  if (typeof window === "undefined") return;
+  if (active) {
+    localStorage.setItem(ACTIVE_EVAL_KEY, JSON.stringify(active));
+  } else {
+    localStorage.removeItem(ACTIVE_EVAL_KEY);
+  }
+}
+
+function persistPendingEvaluation(pending: PendingEvaluation | null) {
+  if (typeof window === "undefined") return;
+  if (pending) {
+    localStorage.setItem(PENDING_EVAL_KEY, JSON.stringify(pending));
+  } else {
+    localStorage.removeItem(PENDING_EVAL_KEY);
+  }
+}
+
 export function ReportsProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [reports, setReports] = useState<Report[]>([]);
@@ -139,12 +303,50 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
   }, [reports]);
 
   useEffect(() => {
-    setReports(loadReports());
+    const loadedReports = loadReports();
+    let restoredActive = restoreActiveEvaluation(loadedReports);
+    let finalReports = loadedReports;
+
+    if (restoredActive?.isComplete) {
+      const report = loadedReports.find((r) => r.id === restoredActive!.reportId);
+      if (report?.status === "PROCESSING") {
+        finalReports = loadedReports.map((r) =>
+          r.id === restoredActive!.reportId
+            ? finalizeReportStatus(r, "COMPLETED")
+            : r,
+        );
+        localStorage.setItem(REPORTS_KEY, JSON.stringify(finalReports));
+      }
+    } else if (restoredActive?.fatalError) {
+      const report = loadedReports.find((r) => r.id === restoredActive!.reportId);
+      if (report?.status === "PROCESSING") {
+        finalReports = loadedReports.map((r) =>
+          r.id === restoredActive!.reportId
+            ? finalizeReportStatus(r, "FAILED")
+            : r,
+        );
+        localStorage.setItem(REPORTS_KEY, JSON.stringify(finalReports));
+      }
+    }
+
+    setReports(finalReports);
     setDefaultEvaluatorState(
       normalizeEvaluatorId(localStorage.getItem(DEFAULT_EVALUATOR_KEY)),
     );
+    setActiveEvaluation(restoredActive);
+    setPendingEvaluation(restorePendingEvaluation(restoredActive));
     setHydrated(true);
   }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    persistActiveEvaluation(activeEvaluation);
+  }, [activeEvaluation, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    persistPendingEvaluation(pendingEvaluation);
+  }, [pendingEvaluation, hydrated]);
 
   const saveReports = useCallback((updated: Report[]) => {
     setReports(updated);
@@ -171,8 +373,12 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
         return;
       }
       saveReports(reports.filter((r) => r.id !== id));
+      if (activeEvaluation?.reportId === id) {
+        setActiveEvaluation(null);
+        setPendingEvaluation(null);
+      }
     },
-    [reports, saveReports],
+    [reports, saveReports, activeEvaluation?.reportId],
   );
 
   const handleCreateNewClick = useCallback(
@@ -384,6 +590,22 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const resumeInterruptedReport = useCallback((reportId: string) => {
+    const report = reportsRef.current.find((r) => r.id === reportId);
+    if (!report) return;
+
+    const restored = buildActiveEvaluationFromReport(report);
+    if (!restored) return;
+
+    setActiveEvaluation(restored);
+    setPendingEvaluation({
+      name: restored.name,
+      evaluator: restored.evaluator,
+      facts: restored.inputFacts,
+      reportId: restored.reportId,
+    });
+  }, []);
+
   const startEvaluation = useCallback(
     (
       name: string,
@@ -579,8 +801,12 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
 
   const handleClearStorage = useCallback(() => {
     localStorage.removeItem(REPORTS_KEY);
+    localStorage.removeItem(ACTIVE_EVAL_KEY);
+    localStorage.removeItem(PENDING_EVAL_KEY);
     localStorage.removeItem("CITATION_CUSTOM_DATASETS");
     setReports([]);
+    setActiveEvaluation(null);
+    setPendingEvaluation(null);
     router.push("/");
   }, [router]);
 
@@ -613,6 +839,7 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
         activeEvaluation,
         pauseEvaluation,
         resumeEvaluation,
+        resumeInterruptedReport,
         registerEvalAbort,
         syncEvaluatedFact,
         finishActiveEvaluation,

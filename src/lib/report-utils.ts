@@ -88,3 +88,28 @@ export function finalizeReportStatus(
 export function isFactPending(fact: Fact): boolean {
   return fact.evaluationStatus === "PENDING";
 }
+
+export function factsToInputPayload(facts: Fact[]): Record<string, unknown>[] {
+  return facts.map((f) => ({
+    fact_id: f.id,
+    id: f.id,
+    fact: f.fact,
+    exact_paragraph: f.evidence_text,
+    evidence_text: f.evidence_text,
+    source_url: f.source_url,
+    publisher: f.publisher,
+    year: f.year,
+    page_no: f.page_no,
+    citation_url: f.citation_url,
+  }));
+}
+
+export function countNotSureFacts(facts: Fact[]): number {
+  return facts.filter(
+    (f) => f.evaluationStatus !== "PENDING" && f.verdict === "NOT_SURE",
+  ).length;
+}
+
+export function countErrorFacts(facts: Fact[]): number {
+  return facts.filter((f) => f.evaluationStatus === "ERROR").length;
+}

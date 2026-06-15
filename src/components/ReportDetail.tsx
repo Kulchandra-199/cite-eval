@@ -1,7 +1,10 @@
 "use client";
 import React, { useState } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { Report, Fact, IssueType, VerdictType, ReviewStatusType } from '@/lib/types';
 import { getEvaluatorLabel } from '@/lib/evaluators';
+import { useReports } from '@/context/ReportsContext';
 import { 
   ArrowLeft, Search, Filter, HelpCircle, ArrowRight, CheckCircle2, 
   XCircle, ChevronLeft, ChevronRight, FileJson, FileSpreadsheet, 
@@ -28,6 +31,8 @@ export default function ReportDetail({
   onBulkUpdate,
   onReRunFact
 }: ReportDetailProps) {
+  const router = useRouter();
+  const { resumeInterruptedReport } = useReports();
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'PASSED' | 'FAILED' | 'NOT_SURE' | 'REVIEWED' | 'NOT_REVIEWED'>('ALL');
   const [issueFilter, setIssueFilter] = useState<IssueType | 'ALL'>('ALL');
@@ -74,6 +79,8 @@ export default function ReportDetail({
   const totalCount = report.facts.length;
   const evaluatedFacts = report.facts.filter((f) => f.evaluationStatus !== "PENDING");
   const pendingEvalCount = report.facts.filter((f) => f.evaluationStatus === "PENDING").length;
+  const isStuckProcessing =
+    report.status === "PROCESSING" && !isLiveEvaluating && pendingEvalCount > 0;
   const passedCount = evaluatedFacts.filter(f => f.verdict === 'PASS').length;
   const failedCount = evaluatedFacts.filter(f => f.verdict === 'FAIL').length;
   const notSureCount = evaluatedFacts.filter(f => f.verdict === 'NOT_SURE').length;
@@ -235,14 +242,25 @@ export default function ReportDetail({
                 : ''}
             </p>
           </div>
-          {isLiveEvaluating && (
-            <a
+          {isLiveEvaluating ? (
+            <Link
               href="/evaluations/progress"
               className="shrink-0 inline-flex items-center justify-center px-3 py-1.5 border border-indigo-600 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded text-[10px] uppercase tracking-wider"
             >
               View progress
-            </a>
-          )}
+            </Link>
+          ) : isStuckProcessing ? (
+            <button
+              type="button"
+              onClick={() => {
+                resumeInterruptedReport(report.id);
+                router.push("/evaluations/progress");
+              }}
+              className="shrink-0 inline-flex items-center justify-center px-3 py-1.5 border border-indigo-600 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded text-[10px] uppercase tracking-wider cursor-pointer"
+            >
+              Resume evaluation
+            </button>
+          ) : null}
         </div>
       )}
 

@@ -20,6 +20,7 @@ export function ActiveEvaluationRunner() {
   } = useReports();
 
   const abortRef = useRef<AbortController | null>(null);
+  const abortReasonRef = useRef<"user" | "supersede">("supersede");
   const runIdRef = useRef(0);
   const currentIndexRef = useRef(0);
 
@@ -35,11 +36,15 @@ export function ActiveEvaluationRunner() {
       return;
     }
 
-    abortRef.current?.abort();
+    if (abortRef.current) {
+      abortReasonRef.current = "supersede";
+      abortRef.current.abort();
+    }
     const controller = new AbortController();
     abortRef.current = controller;
     registerEvalAbort(() => {
       if (!controller.signal.aborted) {
+        abortReasonRef.current = "user";
         controller.abort();
       }
     });
@@ -143,7 +148,9 @@ export function ActiveEvaluationRunner() {
         if (runIdRef.current !== runId) return;
 
         if (err instanceof DOMException && err.name === "AbortError") {
-          pauseActiveEvaluation(currentIndexRef.current);
+          if (abortReasonRef.current === "user") {
+            pauseActiveEvaluation(currentIndexRef.current);
+          }
           return;
         }
 

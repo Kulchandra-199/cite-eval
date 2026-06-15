@@ -59,6 +59,28 @@ export function parseProviderError(err: unknown): EvaluationApiError {
 
   const retryAfterSeconds = readRetryAfterSeconds(apiErr.headers);
 
+  if (
+    err instanceof DOMException &&
+    (err.name === "TimeoutError" || err.name === "AbortError")
+  ) {
+    return new EvaluationApiError(
+      "Groq request timed out. The server may be under load — try Resume to continue.",
+      "network",
+    );
+  }
+
+  if (
+    err instanceof Error &&
+    (/timed?\s*out/i.test(err.message) ||
+      err.name === "TimeoutError" ||
+      err.name === "APIConnectionTimeoutError")
+  ) {
+    return new EvaluationApiError(
+      "Groq request timed out. The server may be under load — try Resume to continue.",
+      "network",
+    );
+  }
+
   if (status === 429 || apiErr.code === "rate_limit_exceeded") {
     return new EvaluationApiError(
       message.includes("Rate limit")
@@ -71,7 +93,7 @@ export function parseProviderError(err: unknown): EvaluationApiError {
 
   if (status === 401 || status === 403) {
     return new EvaluationApiError(
-      "Invalid or missing Groq API key. Check GROQ_API_KEY in .env.local.",
+      "Invalid or missing Groq API key. Set GROQ_API_KEY in Vercel Environment Variables (Production).",
       "auth",
       { status },
     );

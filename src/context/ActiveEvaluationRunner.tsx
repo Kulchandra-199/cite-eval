@@ -2,16 +2,30 @@
 
 import { useEffect, useRef } from "react";
 import { getEvaluatorLabel } from "@/lib/evaluators";
-import { readEvaluationStream } from "@/lib/evaluation-client";
 import { normalizeStreamFact } from "@/lib/report-utils";
 import { useReports } from "@/context/ReportsContext";
 import {
   chunkArray,
   CLIENT_BATCH_SIZE,
-  EvaluationStreamEvent,
+  CLIENT_BATCH_DELAY_MS,
 } from "@/lib/evaluation-config";
 
-/** Runs Groq streaming in the background so evaluation survives page navigation. */
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface BatchEvaluateResponse {
+  facts: Record<string, unknown>[];
+  errors: Array<{
+    factId: string;
+    code: string;
+    message: string;
+    retryAfterSeconds?: number;
+  }>;
+  provider?: string;
+}
+
+/** Runs Groq evaluations in the background so evaluation survives page navigation. */
 export function ActiveEvaluationRunner() {
   const {
     activeEvaluation,
@@ -65,7 +79,7 @@ export function ActiveEvaluationRunner() {
       appendEvalLog({
         id: "init",
         type: "info",
-        text: `Streaming ${inputFacts.length} claim(s) through Groq (${getEvaluatorLabel(evaluator)})...`,
+        text: `Evaluating ${inputFacts.length} claim(s) via Groq (${getEvaluatorLabel(evaluator)})...`,
       });
     } else {
       appendEvalLog({
@@ -89,17 +103,27 @@ export function ActiveEvaluationRunner() {
               .slice(0, batchIndex)
               .reduce((sum, chunk) => sum + chunk.length, 0);
 
+          const claimNumber = batchStartIndex + 1;
+          setActiveEvalStatus(
+            `Verifying claim ${claimNumber} of ${inputFacts.length}...`,
+            { isWaitingForFirst: batchStartIndex === 0 && batchIndex === 0 },
+          );
+
           const response = await fetch("/api/evaluate", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             signal: controller.signal,
-            body: JSON.stringify({ evaluator, facts: batch, stream: true }),
+            body: JSON.stringify({ evaluator, facts: batch }),
           });
 
           if (runIdRef.current !== runId) return;
 
+          const data = (await response.json().catch(() => ({}))) as
+            BatchEvaluateResponse & {
+              error?: { message?: string } | string;
+            };
+
           if (!response.ok) {
-            const data = await response.json().catch(() => ({}));
             const message =
               typeof data.error === "string"
                 ? data.error
@@ -109,66 +133,39 @@ export function ActiveEvaluationRunner() {
             return;
           }
 
-          let batchFinished = false;
+          if (batchIndex === 0 && fromIndex === 0 && data.provider === "groq") {
+            appendEvalLog({
+              id: "groq-active",
+              type: "info",
+              text: "Groq connected — open the report anytime to review finished claims.",
+            });
+          }
 
-          await readEvaluationStream(
-            response,
-            (event: EvaluationStreamEvent) => {
-              if (runIdRef.current !== runId) return;
+          if (!data.facts?.length) {
+            failActiveEvaluation("Evaluation server returned no results.");
+            return;
+          }
 
-              if (event.type === "meta") {
-                const claimNumber = currentIndexRef.current + 1;
-                setActiveEvalStatus(
-                  `Groq connected — verifying claim ${Math.min(claimNumber, inputFacts.length)} of ${inputFacts.length}...`,
-                  { isWaitingForFirst: false },
-                );
-                if (
-                  event.provider === "groq" &&
-                  fromIndex === 0 &&
-                  batchIndex === 0
-                ) {
-                  appendEvalLog({
-                    id: "groq-active",
-                    type: "info",
-                    text: "Groq connected — open the report anytime to review finished claims.",
-                  });
-                }
-                return;
-              }
+          for (let i = 0; i < data.facts.length; i++) {
+            const fact = data.facts[i];
+            const factId = String(
+              fact.id ?? fact.fact_id ?? batch[i]?.fact_id ?? batch[i]?.id ?? "",
+            );
+            const error =
+              data.errors?.find((entry) => entry.factId === factId) ?? null;
+            const globalIndex = batchStartIndex + i;
+            const normalized = normalizeStreamFact(fact, Boolean(error));
+            currentIndexRef.current = globalIndex + 1;
+            syncEvaluatedFact(reportId, globalIndex, normalized, error);
+          }
 
-              if (event.type === "fatal") {
-                failActiveEvaluation(event.error.message);
-                return;
-              }
-
-              if (event.type === "fact") {
-                const globalIndex = batchStartIndex + event.index;
-                const normalized = normalizeStreamFact(
-                  event.fact,
-                  Boolean(event.error),
-                );
-                currentIndexRef.current = globalIndex + 1;
-                syncEvaluatedFact(reportId, globalIndex, normalized, event.error);
-                return;
-              }
-
-              if (event.type === "done") {
-                batchFinished = true;
-              }
-            },
-            controller.signal,
+          setActiveEvalStatus(
+            `Verified ${currentIndexRef.current} / ${inputFacts.length} claims...`,
+            { isWaitingForFirst: false },
           );
 
-          if (runIdRef.current !== runId) return;
-
-          if (!batchFinished) {
-            pauseActiveEvaluation(currentIndexRef.current);
-            appendEvalLog({
-              id: `batch-interrupted-${batchStartIndex}`,
-              type: "info",
-              text: `Connection interrupted after ${currentIndexRef.current} / ${inputFacts.length} claims. Resume to continue.`,
-            });
-            return;
+          if (batchIndex < batches.length - 1) {
+            await sleep(CLIENT_BATCH_DELAY_MS);
           }
         }
 

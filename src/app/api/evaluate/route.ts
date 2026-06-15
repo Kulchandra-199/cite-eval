@@ -4,6 +4,7 @@ import { formatErrorForClient } from "@/lib/api-errors";
 import { normalizeEvaluatorId } from "@/lib/evaluators";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 export const maxDuration = 60;
 
 function isAbortError(error: unknown): boolean {

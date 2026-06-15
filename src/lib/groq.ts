@@ -4,6 +4,8 @@ import { GROQ_MIN_INTERVAL_MS } from "@/lib/evaluation-config";
 import { EvaluatorModelId } from "@/lib/types";
 import { DEFAULT_EVALUATOR } from "@/lib/evaluators";
 
+const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_TIMEOUT_MS = 20_000;
 const MAX_RETRIES = 4;
 
 const EVALUATION_SCHEMA = {
@@ -27,6 +29,17 @@ const EVALUATION_SCHEMA = {
   required: ["verdict", "issue", "reason", "evidence_text"],
   additionalProperties: false,
 };
+
+type GroqResponseFormat =
+  | { type: "json_object" }
+  | {
+      type: "json_schema";
+      json_schema: {
+        name: string;
+        strict: boolean;
+        schema: typeof EVALUATION_SCHEMA;
+      };
+    };
 
 const JSON_SCHEMA_STRICT_MODELS = new Set([
   "openai/gpt-oss-20b",
@@ -77,17 +90,18 @@ async function runThroughGroqQueue<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 export function getGroqClient(): OpenAI | null {
+  if (!process.env.GROQ_API_KEY) return null;
   if (groqClient) return groqClient;
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) return null;
   groqClient = new OpenAI({
-    apiKey,
+    apiKey: process.env.GROQ_API_KEY,
     baseURL: "https://api.groq.com/openai/v1",
+    timeout: GROQ_TIMEOUT_MS,
+    maxRetries: 0,
   });
   return groqClient;
 }
 
-function buildResponseFormat(model: string): OpenAI.ChatCompletionCreateParams["response_format"] {
+function buildResponseFormat(model: string): GroqResponseFormat {
   if (JSON_SCHEMA_STRICT_MODELS.has(model)) {
     return {
       type: "json_schema",
@@ -132,13 +146,63 @@ PAGE: "${fact.page_no ?? "N/A"}"
 Evaluate whether the CLAIM is fully supported by the GROUND TRUTH SEGMENT. Use PASS when fully supported, FAIL when clearly contradicted or unsupported, and NOT_SURE when the ground truth is missing, ambiguous, or insufficient to decide.`;
 }
 
+async function requestGroqCompletion(
+  model: EvaluatorModelId,
+  systemPrompt: string,
+  userPrompt: string,
+): Promise<string> {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    throw parseProviderError(new Error("GROQ_API_KEY is not configured."));
+  }
+
+  const response = await fetch(GROQ_API_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: buildResponseFormat(model),
+    }),
+    signal: AbortSignal.timeout(GROQ_TIMEOUT_MS),
+  });
+
+  const payload = (await response.json().catch(() => ({}))) as {
+    error?: { message?: string; code?: string; type?: string };
+    choices?: Array<{ message?: { content?: string | null } }>;
+  };
+
+  if (!response.ok) {
+    throw {
+      status: response.status,
+      message: payload.error?.message,
+      code: payload.error?.code,
+      headers: response.headers,
+      error: payload.error,
+    };
+  }
+
+  const content = payload.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error("Groq returned an empty response.");
+  }
+
+  return content;
+}
+
 export async function evaluateWithGroq(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   fact: any,
   model: EvaluatorModelId = DEFAULT_EVALUATOR,
 ): Promise<GroqEvaluationResult> {
-  const client = getGroqClient();
-  if (!client) {
+  if (!process.env.GROQ_API_KEY) {
     throw parseProviderError(new Error("GROQ_API_KEY is not configured."));
   }
 
@@ -146,30 +210,20 @@ export async function evaluateWithGroq(
     !JSON_SCHEMA_STRICT_MODELS.has(model) &&
     !JSON_SCHEMA_BEST_EFFORT_MODELS.has(model);
 
+  const systemPrompt = usesJsonObject
+    ? JSON_OBJECT_SYSTEM_PROMPT
+    : "You are a professional citation verification engine. Compare extracted claims against ground-truth source text. Return only schema-valid JSON.";
+
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       return await runThroughGroqQueue(async () => {
-        const response = await client.chat.completions.create({
+        const content = await requestGroqCompletion(
           model,
-          temperature: 0,
-          messages: [
-            {
-              role: "system",
-              content: usesJsonObject
-                ? JSON_OBJECT_SYSTEM_PROMPT
-                : "You are a professional citation verification engine. Compare extracted claims against ground-truth source text. Return only schema-valid JSON.",
-            },
-            { role: "user", content: buildEvaluationPrompt(fact) },
-          ],
-          response_format: buildResponseFormat(model),
-        });
-
-        const content = response.choices[0]?.message?.content;
-        if (!content) {
-          throw new Error("Groq returned an empty response.");
-        }
+          systemPrompt,
+          buildEvaluationPrompt(fact),
+        );
 
         try {
           return JSON.parse(content) as GroqEvaluationResult;

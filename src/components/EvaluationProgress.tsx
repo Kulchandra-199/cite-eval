@@ -1,9 +1,9 @@
 "use client";
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { EvaluatorModelId } from '@/lib/types';
 import { getEvaluatorLabel } from '@/lib/evaluators';
 import { EvaluationStreamEvent } from '@/lib/evaluation-config';
-import { Cpu, CheckCircle2, AlertTriangle, Loader2 } from 'lucide-react';
+import { Cpu, CheckCircle2, AlertTriangle, Loader2, Pause, Play } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 interface EvaluationProgressProps {
@@ -24,6 +24,13 @@ interface EvaluationIssue {
   code: string;
   message: string;
   retryAfterSeconds?: number;
+}
+
+interface VerdictCounts {
+  passed: number;
+  failed: number;
+  notSure: number;
+  errors: number;
 }
 
 function factLogEntry(
@@ -64,9 +71,33 @@ function factLogEntry(
   };
 }
 
+function countFromResults(results: any[], errorsByIndex: Map<number, EvaluationIssue>): VerdictCounts {
+  let passed = 0;
+  let failed = 0;
+  let notSure = 0;
+  let errors = 0;
+
+  results.forEach((f, i) => {
+    if (!f) return;
+    if (errorsByIndex.has(i)) {
+      errors++;
+      notSure++;
+    } else if (f.verdict === 'PASS') {
+      passed++;
+    } else if (f.verdict === 'NOT_SURE') {
+      notSure++;
+    } else {
+      failed++;
+    }
+  });
+
+  return { passed, failed, notSure, errors };
+}
+
 async function readEvaluationStream(
   response: Response,
   onEvent: (event: EvaluationStreamEvent) => void,
+  signal?: AbortSignal,
 ) {
   if (!response.body) {
     throw new Error('No response body from evaluation server.');
@@ -77,6 +108,11 @@ async function readEvaluationStream(
   let buffer = '';
 
   while (true) {
+    if (signal?.aborted) {
+      await reader.cancel();
+      throw new DOMException('Evaluation aborted.', 'AbortError');
+    }
+
     const { done, value } = await reader.read();
     if (done) break;
 
@@ -109,55 +145,124 @@ export default function EvaluationProgress({
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [isComplete, setIsComplete] = useState(false);
-  const [isWaitingForFirst, setIsWaitingForFirst] = useState(true);
-  const [statusLine, setStatusLine] = useState('Connecting to Groq...');
+  const [isPaused, setIsPaused] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
+  const [isWaitingForFirst, setIsWaitingForFirst] = useState(false);
+  const [statusLine, setStatusLine] = useState('Ready to start...');
+
+  const abortRef = useRef<AbortController | null>(null);
+  const resultsRef = useRef<any[]>([]);
+  const errorsRef = useRef<Map<number, EvaluationIssue>>(new Map());
+  const runIdRef = useRef(0);
+  const startedRef = useRef(false);
+  const currentIndexRef = useRef(0);
+  const onCompleteRef = useRef(onComplete);
 
   useEffect(() => {
-    let active = true;
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
 
-    async function runLiveEvaluation() {
+  const syncCounts = useCallback(() => {
+    const counts = countFromResults(resultsRef.current, errorsRef.current);
+    setPassedCount(counts.passed);
+    setFailedCount(counts.failed);
+    setNotSureCount(counts.notSure);
+    setErrorCount(counts.errors);
+  }, []);
+
+  const finishEvaluation = useCallback(() => {
+    const completed = resultsRef.current.filter(Boolean);
+    setIsComplete(true);
+    setIsRunning(false);
+    setIsPaused(false);
+    setIsWaitingForFirst(false);
+    setStatusLine(`All ${facts.length} claims processed.`);
+    setTimeout(() => {
+      onCompleteRef.current(completed);
+    }, 400);
+  }, [facts.length]);
+
+  const runEvaluation = useCallback(async (fromIndex: number) => {
+    const runId = ++runIdRef.current;
+    const remaining = facts.slice(fromIndex);
+
+    if (remaining.length === 0) {
+      finishEvaluation();
+      return;
+    }
+
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    setIsRunning(true);
+    setIsPaused(false);
+    setIsWaitingForFirst(fromIndex === 0 && currentIndex === 0);
+    setFatalError(null);
+    setStatusLine(
+      fromIndex === 0
+        ? 'Connecting to Groq...'
+        : `Resuming from claim ${fromIndex + 1} of ${facts.length}...`
+    );
+
+    if (fromIndex === 0 && resultsRef.current.length === 0) {
       setLogs([{
         id: 'init',
         type: 'info',
         text: `Streaming ${facts.length} claim(s) through Groq (${getEvaluatorLabel(evaluator)})...`
       }]);
+    } else if (fromIndex > 0) {
+      setLogs(prev => [
+        {
+          id: `resume-${fromIndex}-${Date.now()}`,
+          type: 'info',
+          text: `▶ Resumed — ${remaining.length} claim(s) remaining.`
+        },
+        ...prev
+      ]);
+    }
 
-      const allResults: any[] = new Array(facts.length);
-      let pCount = 0;
-      let fCount = 0;
-      let uCount = 0;
-      let eCount = 0;
+    try {
+      const response = await fetch('/api/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({ evaluator, facts: remaining, stream: true }),
+      });
 
-      try {
-        const response = await fetch('/api/evaluate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ evaluator, facts, stream: true }),
-        });
+      if (runIdRef.current !== runId) return;
 
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          const message =
-            typeof data.error === 'string'
-              ? data.error
-              : data.error?.message || `Server returned error status ${response.status}.`;
-          if (!active) return;
-          setFatalError(message);
-          setIsWaitingForFirst(false);
-          setStatusLine('Evaluation stopped.');
-          setLogs(prev => [
-            { id: 'critical-err', type: 'error', text: `Evaluation failed: ${message}` },
-            ...prev
-          ]);
-          return;
-        }
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        const message =
+          typeof data.error === 'string'
+            ? data.error
+            : data.error?.message || `Server returned error status ${response.status}.`;
+        setFatalError(message);
+        setIsRunning(false);
+        setIsWaitingForFirst(false);
+        setStatusLine('Evaluation stopped.');
+        setLogs(prev => [
+          { id: 'critical-err', type: 'error', text: `Evaluation failed: ${message}` },
+          ...prev
+        ]);
+        return;
+      }
 
-        await readEvaluationStream(response, (event) => {
-          if (!active) return;
+      let streamFinished = false;
+
+      await readEvaluationStream(
+        response,
+        (event) => {
+          if (runIdRef.current !== runId) return;
 
           if (event.type === 'meta') {
-            setStatusLine(`Groq connected — verifying claim 1 of ${event.total}...`);
-            if (event.provider === 'offline') {
+            setStatusLine(
+              fromIndex === 0
+                ? `Groq connected — verifying claim 1 of ${facts.length}...`
+                : `Groq connected — verifying claim ${fromIndex + 1} of ${facts.length}...`
+            );
+            if (event.provider === 'offline' && fromIndex === 0) {
               setLogs(prev => [
                 {
                   id: 'fallback-warn',
@@ -166,7 +271,7 @@ export default function EvaluationProgress({
                 },
                 ...prev
               ]);
-            } else if (event.provider === 'groq') {
+            } else if (event.provider === 'groq' && fromIndex === 0) {
               setLogs(prev => [
                 {
                   id: 'groq-active',
@@ -181,6 +286,7 @@ export default function EvaluationProgress({
 
           if (event.type === 'fatal') {
             setFatalError(event.error.message);
+            setIsRunning(false);
             setIsWaitingForFirst(false);
             setStatusLine('Evaluation stopped.');
             setLogs(prev => [
@@ -192,85 +298,113 @@ export default function EvaluationProgress({
 
           if (event.type === 'fact') {
             setIsWaitingForFirst(false);
-            allResults[event.index] = event.fact;
+            const globalIndex = fromIndex + event.index;
+            resultsRef.current[globalIndex] = event.fact;
 
-            const log = factLogEntry(event.fact, event.index, event.error);
             if (event.error) {
-              eCount++;
-              uCount++;
-              setErrorCount(eCount);
-              setNotSureCount(uCount);
-            } else if (event.fact.verdict === 'PASS') {
-              pCount++;
-              setPassedCount(pCount);
-            } else if (event.fact.verdict === 'NOT_SURE') {
-              uCount++;
-              setNotSureCount(uCount);
+              errorsRef.current.set(globalIndex, event.error);
             } else {
-              fCount++;
-              setFailedCount(fCount);
+              errorsRef.current.delete(globalIndex);
             }
 
-            const nextIndex = event.index + 1;
+            syncCounts();
+
+            const nextIndex = globalIndex + 1;
+            currentIndexRef.current = nextIndex;
             setCurrentIndex(nextIndex);
             setStatusLine(
               nextIndex >= facts.length
                 ? `All ${facts.length} claims processed.`
                 : `Verified ${nextIndex} / ${facts.length} — waiting on claim ${nextIndex + 1}...`
             );
-            setLogs(prev => [log, ...prev]);
+            setLogs(prev => [factLogEntry(event.fact, globalIndex, event.error), ...prev]);
             return;
           }
 
           if (event.type === 'done') {
+            streamFinished = true;
             if (event.errors.length > 0) {
               setLogs(prev => [
                 {
-                  id: 'api-errors-summary',
+                  id: `errors-${fromIndex}`,
                   type: 'error',
-                  text: `${event.errors.length} claim(s) could not be verified due to API errors.`
+                  text: `${event.errors.length} claim(s) in this segment had API errors.`
                 },
                 ...prev
               ]);
             }
           }
-        });
+        },
+        controller.signal,
+      );
 
-        if (!active) return;
+      if (runIdRef.current !== runId) return;
 
-        const completed = allResults.filter(Boolean);
-        setIsComplete(true);
+      if (streamFinished) {
+        finishEvaluation();
+      }
+    } catch (err: unknown) {
+      if (runIdRef.current !== runId) return;
+
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        const pausedAt = currentIndexRef.current;
+        setIsRunning(false);
+        setIsPaused(true);
         setIsWaitingForFirst(false);
-        setStatusLine(`All ${facts.length} claims processed.`);
-
-        setTimeout(() => {
-          if (active) onComplete(completed);
-        }, 400);
-
-      } catch (err: unknown) {
-        if (!active) return;
-        const message =
-          err instanceof Error ? err.message : 'Unknown network error.';
-        setFatalError(message);
-        setIsWaitingForFirst(false);
-        setStatusLine('Evaluation stopped.');
+        setStatusLine(`Paused at ${pausedAt} / ${facts.length} claims.`);
         setLogs(prev => [
           {
-            id: 'critical-err',
-            type: 'error',
-            text: `Could not reach evaluation server: ${message}`
+            id: `paused-${Date.now()}`,
+            type: 'info',
+            text: `⏸ Paused — ${pausedAt} of ${facts.length} claim(s) verified. Press Resume to continue.`
           },
           ...prev
         ]);
+        return;
       }
-    }
 
-    runLiveEvaluation();
+      const message =
+        err instanceof Error ? err.message : 'Unknown network error.';
+      setFatalError(message);
+      setIsRunning(false);
+      setIsWaitingForFirst(false);
+      setStatusLine('Evaluation stopped.');
+      setLogs(prev => [
+        {
+          id: 'critical-err',
+          type: 'error',
+          text: `Could not reach evaluation server: ${message}`
+        },
+        ...prev
+      ]);
+    }
+  }, [evaluator, facts, finishEvaluation, syncCounts]);
+
+  useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+    resultsRef.current = new Array(facts.length);
+    errorsRef.current = new Map();
+    runEvaluation(0);
 
     return () => {
-      active = false;
+      runIdRef.current += 1;
+      abortRef.current?.abort();
     };
-  }, [facts, evaluator, reportName, onComplete]);
+  }, [facts.length, runEvaluation]);
+
+  const handlePause = () => {
+    if (!isRunning || isComplete || fatalError) return;
+    abortRef.current?.abort();
+  };
+
+  const handleResume = () => {
+    if (isRunning || isComplete || fatalError) return;
+    runEvaluation(currentIndexRef.current);
+  };
+
+  const canPause = isRunning && !isComplete && !fatalError;
+  const canResume = isPaused && !isRunning && !isComplete && !fatalError && currentIndex < facts.length;
 
   const percent = fatalError
     ? Math.min(100, Math.round((currentIndex / facts.length) * 100))
@@ -294,16 +428,27 @@ export default function EvaluationProgress({
             </div>
           )}
 
-          {isWaitingForFirst && !fatalError && (
+          {isPaused && !fatalError && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-left">
+              <div className="flex items-start gap-2">
+                <Pause className="w-4 h-4 text-amber-700 mt-0.5 shrink-0" />
+                <div>
+                  <p className="text-sm font-bold text-amber-900">Evaluation paused</p>
+                  <p className="text-xs text-amber-800 mt-1">
+                    {currentIndex} of {facts.length} claims verified. Press Resume to continue from claim {currentIndex + 1}.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {isWaitingForFirst && isRunning && !fatalError && (
             <div className="rounded-lg border border-indigo-200 bg-indigo-50 px-4 py-3 text-left">
               <div className="flex items-start gap-2">
                 <Loader2 className="w-4 h-4 text-indigo-600 mt-0.5 shrink-0 animate-spin" />
                 <div>
-                  <p className="text-sm font-bold text-indigo-900">Waiting for first result</p>
+                  <p className="text-sm font-bold text-indigo-900">Waiting for next result</p>
                   <p className="text-xs text-indigo-700 mt-1">{statusLine}</p>
-                  <p className="text-[10px] text-indigo-500 mt-1 font-mono">
-                    First claim typically returns in 1–3 seconds.
-                  </p>
                 </div>
               </div>
             </div>
@@ -314,17 +459,25 @@ export default function EvaluationProgress({
               <AlertTriangle className="w-6 h-6 text-red-500" />
             ) : isComplete ? (
               <CheckCircle2 className="w-6 h-6 text-emerald-500" />
+            ) : isPaused ? (
+              <Pause className="w-6 h-6 text-amber-600" />
             ) : (
               <Cpu className="w-6 h-6 animate-spin" style={{ animationDuration: '4s' }} />
             )}
-            {!fatalError && !isComplete && (
+            {isRunning && !fatalError && !isComplete && (
               <span className="absolute inset-x-0 -bottom-1 h-0.5 bg-indigo-600 animate-pulse"></span>
             )}
           </div>
 
           <div className="space-y-1">
             <h2 className="text-lg font-bold text-slate-900 tracking-tight">
-              {fatalError ? 'Evaluation Stopped' : isComplete ? 'Evaluation Complete' : 'Evaluating Citations'}
+              {fatalError
+                ? 'Evaluation Stopped'
+                : isComplete
+                  ? 'Evaluation Complete'
+                  : isPaused
+                    ? 'Evaluation Paused'
+                    : 'Evaluating Citations'}
             </h2>
             <p className="text-xs text-slate-500 font-mono font-semibold">
               Model <span className="text-indigo-600 font-bold">{getEvaluatorLabel(evaluator)}</span> on {reportName}
@@ -334,6 +487,31 @@ export default function EvaluationProgress({
             )}
           </div>
 
+          {!isComplete && !fatalError && (
+            <div className="flex justify-center gap-3">
+              {canPause && (
+                <button
+                  type="button"
+                  onClick={handlePause}
+                  className="inline-flex items-center gap-2 px-4 py-2 border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-bold rounded text-xs uppercase tracking-wider cursor-pointer"
+                >
+                  <Pause className="w-3.5 h-3.5" />
+                  Pause
+                </button>
+              )}
+              {canResume && (
+                <button
+                  type="button"
+                  onClick={handleResume}
+                  className="inline-flex items-center gap-2 px-4 py-2 border border-indigo-600 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded text-xs uppercase tracking-wider cursor-pointer"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  Resume
+                </button>
+              )}
+            </div>
+          )}
+
           <div className="space-y-2">
             <div className="flex justify-between text-[10px] font-bold text-slate-400 uppercase tracking-widest">
               <span>{currentIndex} / {facts.length} claims</span>
@@ -341,7 +519,15 @@ export default function EvaluationProgress({
             </div>
             <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
               <motion.div
-                className={`h-full ${fatalError ? 'bg-red-500' : isWaitingForFirst ? 'bg-indigo-400 animate-pulse' : 'bg-indigo-600'}`}
+                className={`h-full ${
+                  fatalError
+                    ? 'bg-red-500'
+                    : isPaused
+                      ? 'bg-amber-400'
+                      : isWaitingForFirst
+                        ? 'bg-indigo-400 animate-pulse'
+                        : 'bg-indigo-600'
+                }`}
                 style={{ width: `${percent}%` }}
                 layoutId="progress-gauge"
               ></motion.div>

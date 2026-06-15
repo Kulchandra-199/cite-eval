@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { evaluateFacts, evaluateFactsStream } from "@/lib/evaluator";
 import { formatErrorForClient } from "@/lib/api-errors";
+import { normalizeEvaluatorId } from "@/lib/evaluators";
 
 function isAbortError(error: unknown): boolean {
   return (
@@ -43,7 +44,8 @@ export async function POST(request: Request) {
       return new Response(null, { status: 499 });
     }
 
-    const { facts, evaluator, stream } = payload;
+    const { facts, evaluator: rawEvaluator, stream } = payload;
+    const evaluator = normalizeEvaluatorId(rawEvaluator);
 
     if (!facts || !Array.isArray(facts)) {
       return NextResponse.json(

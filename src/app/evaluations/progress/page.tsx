@@ -7,24 +7,25 @@ import { useReports } from "@/context/ReportsContext";
 
 export default function EvaluationProgressPage() {
   const router = useRouter();
-  const { pendingEvaluation, handleProgressComplete } = useReports();
+  const { activeEvaluation, pendingEvaluation, handleProgressComplete } =
+    useReports();
 
   useEffect(() => {
-    if (!pendingEvaluation) {
+    if (!activeEvaluation && !pendingEvaluation) {
       router.replace("/");
     }
-  }, [pendingEvaluation, router]);
+  }, [activeEvaluation, pendingEvaluation, router]);
 
-  if (!pendingEvaluation) {
+  useEffect(() => {
+    if (activeEvaluation?.isComplete) {
+      const timer = setTimeout(() => handleProgressComplete(), 600);
+      return () => clearTimeout(timer);
+    }
+  }, [activeEvaluation?.isComplete, handleProgressComplete]);
+
+  if (!activeEvaluation) {
     return null;
   }
 
-  return (
-    <EvaluationProgress
-      reportName={pendingEvaluation.name}
-      evaluator={pendingEvaluation.evaluator}
-      facts={pendingEvaluation.facts}
-      onComplete={handleProgressComplete}
-    />
-  );
+  return <EvaluationProgress onViewReport={() => {}} />;
 }

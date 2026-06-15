@@ -13,9 +13,12 @@ export default function ReportPage() {
     handleUpdateFact,
     handleBulkUpdateFacts,
     handleReRunSingleFact,
+    activeEvaluation,
   } = useReports();
 
   const report = getReport(id);
+  const isLiveEvaluating =
+    activeEvaluation?.reportId === id && !activeEvaluation.isComplete;
 
   if (!report) {
     return (
@@ -34,6 +37,7 @@ export default function ReportPage() {
   return (
     <ReportDetail
       report={report}
+      isLiveEvaluating={isLiveEvaluating}
       onBack={() => router.push("/")}
       onUpdateFact={(factId, updates) => handleUpdateFact(id, factId, updates)}
       onBulkUpdate={(factIds, updates) =>

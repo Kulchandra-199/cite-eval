@@ -5,22 +5,56 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
 } from "react";
 import { useRouter } from "next/navigation";
-import { EvaluatorModelId, Fact, Report } from "@/lib/types";
+import { EvaluatorModelId, Fact, Report, ReportStatusType } from "@/lib/types";
 import {
   DEFAULT_EVALUATOR,
   normalizeEvaluatorId,
 } from "@/lib/evaluators";
+import {
+  applyFactToReport,
+  buildPlaceholderFacts,
+  computeReportCounts,
+  finalizeReportStatus,
+} from "@/lib/report-utils";
 
 const REPORTS_KEY = "CITATION_EVAL_REPORTS";
 const DEFAULT_EVALUATOR_KEY = "CITATE_EVAL_DEFAULT_EVALUATOR";
+
+export interface EvalLogEntry {
+  id: string;
+  type: "info" | "pass" | "fail" | "unsure" | "error";
+  text: string;
+}
+
+export interface ActiveEvaluation {
+  reportId: string;
+  name: string;
+  evaluator: EvaluatorModelId;
+  inputFacts: Record<string, unknown>[];
+  fromIndex: number;
+  currentIndex: number;
+  isRunning: boolean;
+  isPaused: boolean;
+  isComplete: boolean;
+  isWaitingForFirst: boolean;
+  fatalError: string | null;
+  statusLine: string;
+  logs: EvalLogEntry[];
+  passedCount: number;
+  failedCount: number;
+  notSureCount: number;
+  errorCount: number;
+}
 
 interface PendingEvaluation {
   name: string;
   evaluator: EvaluatorModelId;
   facts: Record<string, unknown>[];
+  reportId: string;
 }
 
 interface ReportsContextValue {
@@ -37,7 +71,25 @@ interface ReportsContextValue {
     factsList: Record<string, unknown>[],
   ) => void;
   handleEvaluateDataset: (name: string, datasetFacts: Record<string, unknown>[]) => void;
-  handleProgressComplete: (processedFacts: Fact[]) => void;
+  handleProgressComplete: () => void;
+  activeEvaluation: ActiveEvaluation | null;
+  pauseEvaluation: () => void;
+  resumeEvaluation: () => void;
+  registerEvalAbort: (abort: (() => void) | null) => void;
+  syncEvaluatedFact: (
+    reportId: string,
+    index: number,
+    fact: Fact,
+    error: { factId: string; code: string; message: string } | null,
+  ) => void;
+  finishActiveEvaluation: (status: ReportStatusType) => void;
+  failActiveEvaluation: (message: string) => void;
+  pauseActiveEvaluation: (pausedAt: number) => void;
+  appendEvalLog: (entry: EvalLogEntry) => void;
+  setActiveEvalStatus: (
+    statusLine: string,
+    options?: { isWaitingForFirst?: boolean },
+  ) => void;
   handleUpdateFact: (reportId: string, factId: string, updates: Partial<Fact>) => void;
   handleBulkUpdateFacts: (
     reportId: string,
@@ -77,6 +129,14 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
     useState<PendingEvaluation | null>(null);
   const [defaultEvaluator, setDefaultEvaluatorState] =
     useState<EvaluatorModelId>(DEFAULT_EVALUATOR);
+  const [activeEvaluation, setActiveEvaluation] =
+    useState<ActiveEvaluation | null>(null);
+  const reportsRef = useRef<Report[]>([]);
+  const abortEvalRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    reportsRef.current = reports;
+  }, [reports]);
 
   useEffect(() => {
     setReports(loadReports());
@@ -115,31 +175,214 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
     [reports, saveReports],
   );
 
-  const handleReRunReport = useCallback(
-    (id: string) => {
-      const reportToRerun = reports.find((r) => r.id === id);
-      if (!reportToRerun) return;
-
-      setPendingEvaluation({
-        name: reportToRerun.name,
-        evaluator: reportToRerun.evaluator,
-        facts: reportToRerun.facts.map((f) => ({
-          ...f,
-          verdict: undefined,
-          issue: undefined,
-          reason: undefined,
-        })),
-      });
-      saveReports(reports.filter((r) => r.id !== id));
-      router.push("/evaluations/progress");
-    },
-    [reports, saveReports, router],
-  );
-
   const handleCreateNewClick = useCallback(
     () => router.push("/evaluations/new"),
     [router],
   );
+
+  const registerEvalAbort = useCallback((abort: (() => void) | null) => {
+    abortEvalRef.current = abort;
+  }, []);
+
+  const updateReportInStore = useCallback(
+    (reportId: string, updater: (report: Report) => Report) => {
+      const updated = reportsRef.current.map((rep) =>
+        rep.id === reportId ? updater(rep) : rep,
+      );
+      saveReports(updated);
+    },
+    [saveReports],
+  );
+
+  const factLogEntry = useCallback(
+    (
+      f: Fact,
+      globalIndex: number,
+      error?: { message: string } | null,
+    ): EvalLogEntry => {
+      if (error) {
+        return {
+          id: `${f.id}-log-${globalIndex}`,
+          type: "error",
+          text: `[${f.id}] ERROR: ${error.message}`,
+        };
+      }
+      if (f.verdict === "PASS") {
+        return {
+          id: `${f.id}-log-${globalIndex}`,
+          type: "pass",
+          text: `[${f.id}] PASS: Claim matches source context parameters.`,
+        };
+      }
+      if (f.verdict === "NOT_SURE") {
+        return {
+          id: `${f.id}-log-${globalIndex}`,
+          type: "unsure",
+          text: `[${f.id}] NOT SURE: ${f.reason || "Insufficient evidence."}`,
+        };
+      }
+      return {
+        id: `${f.id}-log-${globalIndex}`,
+        type: "fail",
+        text: `[${f.id}] FAIL (${f.issue || "CLAIM_NOT_SUPPORTED"}): ${f.reason}`,
+      };
+    },
+    [],
+  );
+
+  const syncEvaluatedFact = useCallback(
+    (
+      reportId: string,
+      index: number,
+      fact: Fact,
+      error: { factId: string; code: string; message: string } | null,
+    ) => {
+      const report = reportsRef.current.find((r) => r.id === reportId);
+      if (!report) return;
+
+      const updatedReport = applyFactToReport(report, index, fact);
+      saveReports(
+        reportsRef.current.map((r) => (r.id === reportId ? updatedReport : r)),
+      );
+
+      const counts = computeReportCounts(updatedReport.facts);
+      const nextIndex = index + 1;
+      const total = report.factCount;
+
+      setActiveEvaluation((prev) => {
+        if (!prev || prev.reportId !== reportId) return prev;
+
+        return {
+          ...prev,
+          currentIndex: nextIndex,
+          passedCount: counts.passedCount,
+          failedCount: counts.failedCount,
+          notSureCount: updatedReport.facts.filter(
+            (f) =>
+              f.evaluationStatus !== "PENDING" && f.verdict === "NOT_SURE",
+          ).length,
+          errorCount: updatedReport.facts.filter(
+            (f) => f.evaluationStatus === "ERROR",
+          ).length,
+          isWaitingForFirst: false,
+          statusLine:
+            nextIndex >= total
+              ? `All ${total} claims processed.`
+              : `Verified ${nextIndex} / ${total} — claim ${nextIndex + 1} in progress...`,
+          logs: [factLogEntry(fact, index, error), ...prev.logs].slice(0, 30),
+        };
+      });
+    },
+    [saveReports, factLogEntry],
+  );
+
+  const appendEvalLog = useCallback((entry: EvalLogEntry) => {
+    setActiveEvaluation((prev) =>
+      prev ? { ...prev, logs: [entry, ...prev.logs].slice(0, 30) } : prev,
+    );
+  }, []);
+
+  const setActiveEvalStatus = useCallback(
+    (
+      statusLine: string,
+      options?: { isWaitingForFirst?: boolean },
+    ) => {
+      setActiveEvaluation((prev) =>
+        prev
+          ? {
+              ...prev,
+              statusLine,
+              isWaitingForFirst: options?.isWaitingForFirst ?? prev.isWaitingForFirst,
+            }
+          : prev,
+      );
+    },
+    [],
+  );
+
+  const finishActiveEvaluation = useCallback(
+    (status: ReportStatusType) => {
+      setActiveEvaluation((prev) => {
+        if (!prev) return prev;
+        updateReportInStore(prev.reportId, (report) =>
+          finalizeReportStatus(report, status),
+        );
+        return {
+          ...prev,
+          isRunning: false,
+          isPaused: false,
+          isComplete: true,
+          isWaitingForFirst: false,
+          statusLine: `All ${prev.inputFacts.length} claims processed.`,
+        };
+      });
+      setPendingEvaluation(null);
+    },
+    [updateReportInStore],
+  );
+
+  const failActiveEvaluation = useCallback(
+    (message: string) => {
+      setActiveEvaluation((prev) => {
+        if (!prev) return prev;
+        updateReportInStore(prev.reportId, (report) =>
+          finalizeReportStatus(report, "FAILED"),
+        );
+        return {
+          ...prev,
+          isRunning: false,
+          isPaused: false,
+          fatalError: message,
+          isWaitingForFirst: false,
+          statusLine: "Evaluation stopped — partial results saved.",
+          logs: [
+            { id: "fatal-err", type: "error" as const, text: message },
+            ...prev.logs,
+          ].slice(0, 30),
+        };
+      });
+    },
+    [updateReportInStore],
+  );
+
+  const pauseActiveEvaluation = useCallback((pausedAt: number) => {
+    setActiveEvaluation((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        isRunning: false,
+        isPaused: true,
+        isWaitingForFirst: false,
+        currentIndex: pausedAt,
+        statusLine: `Paused at ${pausedAt} / ${prev.inputFacts.length} claims.`,
+        logs: [
+          {
+            id: `paused-${Date.now()}`,
+            type: "info" as const,
+            text: `⏸ Paused — ${pausedAt} of ${prev.inputFacts.length} verified. Open the report to review, then Resume.`,
+          },
+          ...prev.logs,
+        ].slice(0, 30),
+      };
+    });
+  }, []);
+
+  const pauseEvaluation = useCallback(() => {
+    abortEvalRef.current?.();
+  }, []);
+
+  const resumeEvaluation = useCallback(() => {
+    setActiveEvaluation((prev) => {
+      if (!prev || prev.isRunning || prev.isComplete) return prev;
+      return {
+        ...prev,
+        isRunning: true,
+        isPaused: false,
+        fromIndex: prev.currentIndex,
+        fatalError: null,
+      };
+    });
+  }, []);
 
   const startEvaluation = useCallback(
     (
@@ -147,10 +390,73 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
       evaluator: EvaluatorModelId,
       factsList: Record<string, unknown>[],
     ) => {
-      setPendingEvaluation({ name, evaluator, facts: factsList });
+      const reportId = `rep_${Date.now()}`;
+      const placeholderFacts = buildPlaceholderFacts(factsList);
+      const counts = computeReportCounts(placeholderFacts);
+
+      const newReport: Report = {
+        id: reportId,
+        name,
+        createdAt: new Date().toISOString(),
+        sourceCount: counts.sourceCount,
+        factCount: placeholderFacts.length,
+        passedCount: 0,
+        failedCount: 0,
+        status: "PROCESSING",
+        evaluator,
+        facts: placeholderFacts,
+      };
+
+      saveReports([newReport, ...reportsRef.current]);
+      setPendingEvaluation({ name, evaluator, facts: factsList, reportId });
+      setActiveEvaluation({
+        reportId,
+        name,
+        evaluator,
+        inputFacts: factsList,
+        fromIndex: 0,
+        currentIndex: 0,
+        isRunning: true,
+        isPaused: false,
+        isComplete: false,
+        isWaitingForFirst: true,
+        fatalError: null,
+        statusLine: "Connecting to Groq...",
+        logs: [],
+        passedCount: 0,
+        failedCount: 0,
+        notSureCount: 0,
+        errorCount: 0,
+      });
       router.push("/evaluations/progress");
     },
-    [router],
+    [saveReports, router],
+  );
+
+  const handleReRunReport = useCallback(
+    (id: string) => {
+      const reportToRerun = reports.find((r) => r.id === id);
+      if (!reportToRerun) return;
+
+      saveReports(reports.filter((r) => r.id !== id));
+      startEvaluation(
+        reportToRerun.name,
+        reportToRerun.evaluator,
+        reportToRerun.facts.map((f) => ({
+          fact_id: f.id,
+          id: f.id,
+          fact: f.fact,
+          exact_paragraph: f.evidence_text,
+          evidence_text: f.evidence_text,
+          source_url: f.source_url,
+          publisher: f.publisher,
+          year: f.year,
+          page_no: f.page_no,
+          citation_url: f.citation_url,
+        })),
+      );
+    },
+    [reports, saveReports, startEvaluation],
   );
 
   const handleEvaluationFormSubmit = useCallback(
@@ -168,40 +474,10 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
     [startEvaluation, defaultEvaluator],
   );
 
-  const handleProgressComplete = useCallback(
-    (processedFacts: Fact[]) => {
-      if (!pendingEvaluation) return;
-
-      const normalizedFacts: Fact[] = processedFacts.map((f, i) => ({
-        ...f,
-        id: f.id || (f as Fact & { fact_id?: string }).fact_id || `F${i + 1}`,
-      }));
-
-      const passed = normalizedFacts.filter((f) => f.verdict === "PASS").length;
-      const failed = normalizedFacts.filter((f) => f.verdict === "FAIL").length;
-
-      const newReport: Report = {
-        id: `rep_${Date.now()}`,
-        name: pendingEvaluation.name,
-        createdAt: new Date().toISOString(),
-        sourceCount:
-          Array.from(
-            new Set(normalizedFacts.map((f) => f.source_url)),
-          ).filter(Boolean).length || 1,
-        factCount: normalizedFacts.length,
-        passedCount: passed,
-        failedCount: failed,
-        status: "COMPLETED",
-        evaluator: pendingEvaluation.evaluator,
-        facts: normalizedFacts,
-      };
-
-      saveReports([newReport, ...reports]);
-      setPendingEvaluation(null);
-      router.push(`/reports/${newReport.id}`);
-    },
-    [pendingEvaluation, reports, saveReports, router],
-  );
+  const handleProgressComplete = useCallback(() => {
+    if (!activeEvaluation?.reportId) return;
+    router.push(`/reports/${activeEvaluation.reportId}`);
+  }, [activeEvaluation?.reportId, router]);
 
   const handleUpdateFact = useCallback(
     (reportId: string, factId: string, updates: Partial<Fact>) => {
@@ -334,6 +610,16 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
         handleEvaluationFormSubmit,
         handleEvaluateDataset,
         handleProgressComplete,
+        activeEvaluation,
+        pauseEvaluation,
+        resumeEvaluation,
+        registerEvalAbort,
+        syncEvaluatedFact,
+        finishActiveEvaluation,
+        failActiveEvaluation,
+        pauseActiveEvaluation,
+        appendEvalLog,
+        setActiveEvalStatus,
         handleUpdateFact,
         handleBulkUpdateFacts,
         handleReRunSingleFact,

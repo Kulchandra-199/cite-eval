@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Database } from "lucide-react";
 import { ReportsProvider, useReports } from "@/context/ReportsContext";
+import { ActiveEvaluationRunner } from "@/context/ActiveEvaluationRunner";
 import { getEvaluatorLabel, DEFAULT_EVALUATOR } from "@/lib/evaluators";
 
 function AppHeader() {
@@ -103,6 +104,7 @@ function AppFooter() {
 export function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <ReportsProvider>
+      <ActiveEvaluationRunner />
       <div className="flex min-h-screen flex-col bg-slate-50 font-sans text-slate-800 antialiased">
         <AppHeader />
         <main className="mx-auto w-full max-w-7xl flex-1 p-4 md:p-8">

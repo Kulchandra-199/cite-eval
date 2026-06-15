@@ -2,6 +2,13 @@ import { NextResponse } from "next/server";
 import { evaluateFacts, evaluateFactsStream } from "@/lib/evaluator";
 import { formatErrorForClient } from "@/lib/api-errors";
 
+function isAbortError(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (error instanceof Error && error.name === "AbortError")
+  );
+}
+
 export async function POST(request: Request) {
   try {
     const { facts, evaluator, stream } = await request.json();
@@ -15,24 +22,56 @@ export async function POST(request: Request) {
 
     if (stream) {
       const encoder = new TextEncoder();
+      let closed = false;
+
       const readable = new ReadableStream({
+        cancel() {
+          closed = true;
+        },
         async start(controller) {
+          const safeEnqueue = (chunk: string): boolean => {
+            if (closed || request.signal.aborted) {
+              closed = true;
+              return false;
+            }
+            try {
+              controller.enqueue(encoder.encode(chunk));
+              return true;
+            } catch {
+              closed = true;
+              return false;
+            }
+          };
+
+          const safeClose = () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              /* already closed by client disconnect */
+            }
+          };
+
           try {
-            for await (const event of evaluateFactsStream(facts, evaluator)) {
-              controller.enqueue(
-                encoder.encode(`${JSON.stringify(event)}\n`),
-              );
+            for await (const event of evaluateFactsStream(
+              facts,
+              evaluator,
+              request.signal,
+            )) {
+              if (!safeEnqueue(`${JSON.stringify(event)}\n`)) {
+                break;
+              }
             }
           } catch (error) {
+            if (isAbortError(error) || request.signal.aborted) {
+              return;
+            }
             console.error("Error in /api/evaluate stream:", error);
             const formatted = formatErrorForClient(error);
-            controller.enqueue(
-              encoder.encode(
-                `${JSON.stringify({ type: "fatal", error: formatted })}\n`,
-              ),
-            );
+            safeEnqueue(`${JSON.stringify({ type: "fatal", error: formatted })}\n`);
           } finally {
-            controller.close();
+            safeClose();
           }
         },
       });

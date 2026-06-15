@@ -468,9 +468,17 @@ export async function evaluateFacts(
 export async function* evaluateFactsStream(
   facts: any[],
   evaluator: EvaluatorModelId = DEFAULT_EVALUATOR,
+  signal?: AbortSignal,
 ): AsyncGenerator<EvaluationStreamEvent> {
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      throw new DOMException("Evaluation stream aborted.", "AbortError");
+    }
+  };
+
   const provider = getActiveProvider();
 
+  throwIfAborted();
   yield { type: "meta", provider, total: facts.length };
 
   const errors: EvaluationIssue[] = [];
@@ -478,25 +486,29 @@ export async function* evaluateFactsStream(
 
   if (provider === "offline") {
     for (let i = 0; i < facts.length; i++) {
+      throwIfAborted();
       const fact = evaluateFactLocal(facts[i], i);
       yield { type: "fact", index: i, fact, error: null };
     }
+    throwIfAborted();
     yield { type: "done", usingFallback: true, provider, errors };
     return;
   }
 
-  // Sequential streaming: first result arrives after a single Groq call (~1–2s).
   for (let i = 0; i < facts.length; i++) {
+    throwIfAborted();
     const { fact, error, usedFallback: factFallback } = await evaluateWithProvider(
       facts[i],
       i,
       evaluator,
     );
+    throwIfAborted();
     if (error) errors.push(error);
     if (factFallback) usedFallback = true;
     yield { type: "fact", index: i, fact, error: error ?? null };
   }
 
+  throwIfAborted();
   yield { type: "done", usingFallback: usedFallback, provider, errors };
 }
 

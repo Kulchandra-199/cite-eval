@@ -9,6 +9,9 @@ export type VerdictType = "PASS" | "FAIL" | "NOT_SURE";
 
 export type ReviewStatusType = "PENDING" | "REVIEWED";
 
+/** Whether Groq has finished evaluating this claim. */
+export type FactEvaluationStatus = "PENDING" | "EVALUATED" | "ERROR";
+
 /** Groq model ID used for citation evaluation */
 export type EvaluatorModelId =
   | "llama-3.3-70b-versatile"
@@ -32,6 +35,7 @@ export interface Fact {
   citation_url: string;
   review_status: ReviewStatusType;
   reviewer_notes: string;
+  evaluationStatus?: FactEvaluationStatus;
 }
 
 export interface Report {

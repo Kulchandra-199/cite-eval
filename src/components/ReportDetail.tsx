@@ -13,6 +13,7 @@ import FactDetail from '@/components/FactDetail';
 
 interface ReportDetailProps {
   report: Report;
+  isLiveEvaluating?: boolean;
   onBack: () => void;
   onUpdateFact: (factId: string, updatedParams: Partial<Fact>) => void;
   onBulkUpdate: (factIds: string[], updatedParams: Partial<Fact>) => void;
@@ -21,6 +22,7 @@ interface ReportDetailProps {
 
 export default function ReportDetail({
   report,
+  isLiveEvaluating = false,
   onBack,
   onUpdateFact,
   onBulkUpdate,
@@ -70,9 +72,11 @@ export default function ReportDetail({
 
   // Calculate stats dynamically based on current state of facts
   const totalCount = report.facts.length;
-  const passedCount = report.facts.filter(f => f.verdict === 'PASS').length;
-  const failedCount = report.facts.filter(f => f.verdict === 'FAIL').length;
-  const notSureCount = report.facts.filter(f => f.verdict === 'NOT_SURE').length;
+  const evaluatedFacts = report.facts.filter((f) => f.evaluationStatus !== "PENDING");
+  const pendingEvalCount = report.facts.filter((f) => f.evaluationStatus === "PENDING").length;
+  const passedCount = evaluatedFacts.filter(f => f.verdict === 'PASS').length;
+  const failedCount = evaluatedFacts.filter(f => f.verdict === 'FAIL').length;
+  const notSureCount = evaluatedFacts.filter(f => f.verdict === 'NOT_SURE').length;
   const pendingReviewCount = report.facts.filter(f => f.review_status === 'PENDING').length;
   const reviewedCount = report.facts.filter(f => f.review_status === 'REVIEWED').length;
 
@@ -220,6 +224,28 @@ export default function ReportDetail({
         </div>
       </div>
 
+      {(isLiveEvaluating || report.status === 'PROCESSING') && (
+        <div className="rounded-lg border border-indigo-200 bg-indigo-50 px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-bold text-indigo-900">Evaluation in progress</p>
+            <p className="text-xs text-indigo-700 mt-0.5">
+              {evaluatedFacts.length} of {totalCount} claims verified.
+              {pendingEvalCount > 0
+                ? ` You can review and edit finished claims while the rest are processed.`
+                : ''}
+            </p>
+          </div>
+          {isLiveEvaluating && (
+            <a
+              href="/evaluations/progress"
+              className="shrink-0 inline-flex items-center justify-center px-3 py-1.5 border border-indigo-600 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded text-[10px] uppercase tracking-wider"
+            >
+              View progress
+            </a>
+          )}
+        </div>
+      )}
+
       {/* Header Cards (Dashboard Metadata Stats) */}
       <div className="bg-white border border-slate-200 rounded-lg p-5 shadow-none" id="detail-header-card">
         <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
@@ -253,7 +279,11 @@ export default function ReportDetail({
               <span className="text-base font-bold text-slate-700 mt-0.5 block">{notSureCount}</span>
             </div>
             <div className="px-4 py-2 bg-amber-50 border border-amber-100 rounded text-center min-w-[70px]">
-              <span className="text-[10px] text-amber-700 font-bold uppercase tracking-widest block">Pending</span>
+              <span className="text-[10px] text-amber-700 font-bold uppercase tracking-widest block">Queued</span>
+              <span className="text-base font-bold text-amber-600 mt-0.5 block">{pendingEvalCount}</span>
+            </div>
+            <div className="px-4 py-2 bg-amber-50 border border-amber-100 rounded text-center min-w-[70px]">
+              <span className="text-[10px] text-amber-700 font-bold uppercase tracking-widest block">Review</span>
               <span className="text-base font-bold text-amber-600 mt-0.5 block">{pendingReviewCount}</span>
             </div>
           </div>
@@ -431,7 +461,11 @@ export default function ReportDetail({
                           </p>
                         </td>
                         <td className="px-4 py-3 text-center whitespace-nowrap">
-                          {fact.verdict === 'PASS' ? (
+                          {fact.evaluationStatus === 'PENDING' ? (
+                            <span className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-bold rounded bg-indigo-100 text-indigo-700 border border-indigo-200 animate-pulse">
+                              QUEUED
+                            </span>
+                          ) : fact.verdict === 'PASS' ? (
                             <span className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800">
                               PASS
                             </span>

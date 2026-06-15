@@ -3,6 +3,13 @@ import React, { useState, useEffect } from 'react';
 import { ShieldCheck, Cpu, Sliders, RefreshCw, AlertCircle, Database, ToggleLeft, ToggleRight, Sparkles, AlertTriangle, CheckCircle } from 'lucide-react';
 import { EVALUATOR_OPTIONS } from '@/lib/evaluators';
 import { EvaluatorModelId } from '@/lib/types';
+import {
+  getBrowserGroqApiKey,
+  getEvaluationApiUrl,
+  setBrowserGroqApiKey,
+  setEvaluationApiUrl,
+} from '@/lib/evaluation-api';
+import { evaluateFactWithBrowserGroq } from '@/lib/groq-browser';
 
 interface SettingsViewProps {
   onBack: () => void;
@@ -31,6 +38,8 @@ export default function SettingsView({
   // Backend validation health checks
   const [apiStatus, setApiStatus] = useState<'IDLE' | 'PINGING' | 'LIVE_AI' | 'LIVE_OFFLINE' | 'FAILED'>('IDLE');
   const [apiNotes, setApiNotes] = useState<string>('');
+  const [browserGroqKey, setBrowserGroqKeyState] = useState<string>(() => getBrowserGroqApiKey() ?? '');
+  const [evaluationApiUrl, setEvaluationApiUrlState] = useState<string>(() => getEvaluationApiUrl());
 
   useEffect(() => {
     localStorage.setItem('SETTINGS_SIMULATE_LATENCY', String(latencyActive));
@@ -44,14 +53,48 @@ export default function SettingsView({
     localStorage.setItem('SETTINGS_DETAILED_TELEMETRY', String(detailedTelemetry));
   }, [detailedTelemetry]);
 
+  useEffect(() => {
+    setBrowserGroqApiKey(browserGroqKey);
+  }, [browserGroqKey]);
+
+  useEffect(() => {
+    setEvaluationApiUrl(evaluationApiUrl);
+  }, [evaluationApiUrl]);
+
   // Perform API ping sequence
   const handleTestBackendConnection = async () => {
     setApiStatus('PINGING');
-    setApiNotes('Pinging validation gateway endpoint at /api/evaluate ...');
+
+    if (browserGroqKey.trim()) {
+      setApiNotes('Testing Groq directly from your browser (Vercel bypass mode)...');
+      try {
+        const start = Date.now();
+        await evaluateFactWithBrowserGroq(
+          {
+            fact_id: 'PING_CHECK',
+            fact: 'Test verification handshake',
+            exact_paragraph: 'Test verification handshake',
+          },
+          browserGroqKey.trim(),
+          currentEvaluator,
+        );
+        const latency = Date.now() - start;
+        setApiStatus('LIVE_AI');
+        setApiNotes(`Browser Groq OK in ${latency}ms. Evaluations will bypass Vercel serverless timeouts.`);
+        return;
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : 'Browser Groq test failed.';
+        setApiStatus('FAILED');
+        setApiNotes(`${message} Check the API key or use a custom Evaluation API URL below.`);
+        return;
+      }
+    }
+
+    setApiNotes(`Pinging ${evaluationApiUrl || '/api/evaluate'} ...`);
 
     try {
       const start = Date.now();
-      const response = await fetch('/api/evaluate', {
+      const response = await fetch(evaluationApiUrl || '/api/evaluate', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -174,6 +217,48 @@ export default function SettingsView({
                 )}
               </button>
             ))}
+          </div>
+        </div>
+
+        {/* Vercel / browser Groq bypass */}
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-6 space-y-4">
+          <div className="flex items-start gap-3">
+            <div className="p-2 bg-amber-100 text-amber-700 rounded">
+              <AlertCircle className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="font-bold text-amber-950 text-sm">Vercel Deployment Fix</h3>
+              <p className="text-xs text-amber-800 mt-0.5 leading-relaxed">
+                Vercel Hobby functions time out after <strong>10 seconds</strong> (your error: <code className="font-mono">FUNCTION_INVOCATION_TIMEOUT</code>).
+                Paste your Groq API key below to run evaluations <strong>directly from your browser</strong> — this bypasses Vercel entirely.
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <label className="block">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-amber-900">Browser Groq API Key (recommended on Vercel)</span>
+              <input
+                type="password"
+                value={browserGroqKey}
+                onChange={(e) => setBrowserGroqKeyState(e.target.value)}
+                placeholder="gsk_..."
+                className="mt-1 w-full rounded border border-amber-300 bg-white px-3 py-2 text-xs font-mono text-slate-800"
+              />
+            </label>
+            <label className="block">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-amber-900">Custom Evaluation API URL (optional)</span>
+              <input
+                type="url"
+                value={evaluationApiUrl}
+                onChange={(e) => setEvaluationApiUrlState(e.target.value)}
+                placeholder="/api/evaluate or https://your-proxy.example/api/evaluate"
+                className="mt-1 w-full rounded border border-amber-300 bg-white px-3 py-2 text-xs font-mono text-slate-800"
+              />
+              <p className="text-[10px] text-amber-700 mt-1">
+                Use <code className="font-mono">npm run dev</code> locally and set this to <code className="font-mono">http://localhost:3000/api/evaluate</code> if you prefer server-side Groq.
+              </p>
+            </label>
           </div>
         </div>
 

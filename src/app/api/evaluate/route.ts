@@ -5,7 +5,8 @@ import { normalizeEvaluatorId } from "@/lib/evaluators";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 10;
+export const preferredRegion = ["iad1", "sfo1", "cle1"];
 
 function isAbortError(error: unknown): boolean {
   return (

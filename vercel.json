@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "src/app/api/evaluate/route.ts": {
+      "maxDuration": 10
+    },
+    "src/app/api/evaluate-single/route.ts": {
+      "maxDuration": 10
+    }
+  }
+}

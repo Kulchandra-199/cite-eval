@@ -9,10 +9,15 @@ export interface EvaluatorOption {
 
 export const EVALUATOR_OPTIONS: EvaluatorOption[] = [
   {
+    id: "llama-3.1-8b-instant",
+    label: "Llama 3.1 8B Instant",
+    description: "Fastest — best for Vercel / browser evaluation",
+    recommended: true,
+  },
+  {
     id: "llama-3.3-70b-versatile",
     label: "Llama 3.3 70B",
-    description: "Fast general-purpose verification via Groq",
-    recommended: true,
+    description: "Higher quality, slower — use locally or in browser mode",
   },
   {
     id: "openai/gpt-oss-20b",
@@ -26,7 +31,7 @@ export const EVALUATOR_OPTIONS: EvaluatorOption[] = [
   },
 ];
 
-export const DEFAULT_EVALUATOR: EvaluatorModelId = "llama-3.3-70b-versatile";
+export const DEFAULT_EVALUATOR: EvaluatorModelId = "llama-3.1-8b-instant";
 
 /** Map legacy AI Studio labels stored in localStorage to real Groq model IDs */
 const LEGACY_EVALUATOR_MAP: Record<string, EvaluatorModelId> = {

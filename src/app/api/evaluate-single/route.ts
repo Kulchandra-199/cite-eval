@@ -1,10 +1,17 @@
 import { NextResponse } from "next/server";
 import { evaluateSingleFact } from "@/lib/evaluator";
 import { formatErrorForClient } from "@/lib/api-errors";
+import { normalizeEvaluatorId } from "@/lib/evaluators";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const maxDuration = 10;
+export const preferredRegion = ["iad1", "sfo1", "cle1"];
 
 export async function POST(request: Request) {
   try {
-    const { fact, evaluator } = await request.json();
+    const { fact, evaluator: rawEvaluator } = await request.json();
+    const evaluator = normalizeEvaluatorId(rawEvaluator);
 
     if (!fact) {
       return NextResponse.json(

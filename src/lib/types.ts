@@ -14,6 +14,7 @@ export type FactEvaluationStatus = "PENDING" | "EVALUATED" | "ERROR";
 
 /** Groq model ID used for citation evaluation */
 export type EvaluatorModelId =
+  | "llama-3.1-8b-instant"
   | "llama-3.3-70b-versatile"
   | "openai/gpt-oss-20b"
   | "meta-llama/llama-4-scout-17b-16e-instruct";

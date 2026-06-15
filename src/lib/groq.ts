@@ -5,8 +5,9 @@ import { EvaluatorModelId } from "@/lib/types";
 import { DEFAULT_EVALUATOR } from "@/lib/evaluators";
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_TIMEOUT_MS = 20_000;
+const GROQ_TIMEOUT_MS = process.env.VERCEL ? 8_000 : 20_000;
 const MAX_RETRIES = 4;
+const VERCEL_FAST_MODEL: EvaluatorModelId = "llama-3.1-8b-instant";
 
 const EVALUATION_SCHEMA = {
   type: "object",
@@ -206,9 +207,11 @@ export async function evaluateWithGroq(
     throw parseProviderError(new Error("GROQ_API_KEY is not configured."));
   }
 
+  const resolvedModel = resolveGroqModelForServer(model);
+
   const usesJsonObject =
-    !JSON_SCHEMA_STRICT_MODELS.has(model) &&
-    !JSON_SCHEMA_BEST_EFFORT_MODELS.has(model);
+    !JSON_SCHEMA_STRICT_MODELS.has(resolvedModel) &&
+    !JSON_SCHEMA_BEST_EFFORT_MODELS.has(resolvedModel);
 
   const systemPrompt = usesJsonObject
     ? JSON_OBJECT_SYSTEM_PROMPT
@@ -220,7 +223,7 @@ export async function evaluateWithGroq(
     try {
       return await runThroughGroqQueue(async () => {
         const content = await requestGroqCompletion(
-          model,
+          resolvedModel,
           systemPrompt,
           buildEvaluationPrompt(fact),
         );
@@ -258,4 +261,18 @@ export function getActiveProvider(): "groq" | "gemini" | "offline" {
   if (process.env.GROQ_API_KEY) return "groq";
   if (process.env.GEMINI_API_KEY) return "gemini";
   return "offline";
+}
+
+/** On Vercel Hobby, large models exceed the 10s function cap — use a fast model. */
+export function resolveGroqModelForServer(
+  requested: EvaluatorModelId = DEFAULT_EVALUATOR,
+): EvaluatorModelId {
+  if (!process.env.VERCEL) return requested;
+  if (
+    requested === "llama-3.3-70b-versatile" ||
+    requested === "openai/gpt-oss-20b"
+  ) {
+    return VERCEL_FAST_MODEL;
+  }
+  return requested;
 }

@@ -9,6 +9,16 @@ import {
   CLIENT_BATCH_SIZE,
   CLIENT_BATCH_DELAY_MS,
 } from "@/lib/evaluation-config";
+import {
+  getBrowserGroqApiKey,
+  getEvaluationApiUrl,
+  shouldUseBrowserGroq,
+} from "@/lib/evaluation-api";
+import {
+  evaluateFactWithBrowserGroq,
+  formatBrowserFactResult,
+} from "@/lib/groq-browser";
+import { toEvaluationIssue } from "@/lib/api-errors";
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -49,6 +59,8 @@ export function ActiveEvaluationRunner() {
     const runId = ++runIdRef.current;
     const { reportId, evaluator, inputFacts, fromIndex } = activeEvaluation;
     const remaining = inputFacts.slice(fromIndex);
+    const useBrowserGroq = shouldUseBrowserGroq();
+    const browserGroqKey = getBrowserGroqApiKey();
 
     if (remaining.length === 0) {
       finishActiveEvaluation("COMPLETED");
@@ -70,7 +82,9 @@ export function ActiveEvaluationRunner() {
 
     setActiveEvalStatus(
       fromIndex === 0
-        ? "Connecting to Groq..."
+        ? useBrowserGroq
+          ? "Connecting to Groq (browser)..."
+          : "Connecting to Groq..."
         : `Resuming from claim ${fromIndex + 1} of ${inputFacts.length}...`,
       { isWaitingForFirst: fromIndex === 0 && currentIndexRef.current === 0 },
     );
@@ -79,7 +93,9 @@ export function ActiveEvaluationRunner() {
       appendEvalLog({
         id: "init",
         type: "info",
-        text: `Evaluating ${inputFacts.length} claim(s) via Groq (${getEvaluatorLabel(evaluator)})...`,
+        text: useBrowserGroq
+          ? `Evaluating ${inputFacts.length} claim(s) via Groq in your browser (${getEvaluatorLabel(evaluator)})...`
+          : `Evaluating ${inputFacts.length} claim(s) via Groq (${getEvaluatorLabel(evaluator)})...`,
       });
     } else {
       appendEvalLog({
@@ -93,6 +109,88 @@ export function ActiveEvaluationRunner() {
 
     (async () => {
       try {
+        if (useBrowserGroq && browserGroqKey) {
+          if (fromIndex === 0) {
+            appendEvalLog({
+              id: "groq-active",
+              type: "info",
+              text: "Groq browser mode — bypasses Vercel serverless timeouts.",
+            });
+          }
+
+          for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+            if (runIdRef.current !== runId) return;
+            if (controller.signal.aborted) {
+              throw new DOMException("Evaluation aborted.", "AbortError");
+            }
+
+            const batch = batches[batchIndex];
+            const batchStartIndex =
+              fromIndex +
+              batches
+                .slice(0, batchIndex)
+                .reduce((sum, chunk) => sum + chunk.length, 0);
+
+            for (let i = 0; i < batch.length; i++) {
+              if (runIdRef.current !== runId) return;
+
+              const rawFact = batch[i];
+              const globalIndex = batchStartIndex + i;
+              const factId = String(
+                rawFact.fact_id ?? rawFact.id ?? `F${globalIndex + 1}`,
+              );
+
+              setActiveEvalStatus(
+                `Verifying claim ${globalIndex + 1} of ${inputFacts.length}...`,
+                { isWaitingForFirst: false },
+              );
+
+              try {
+                const parsed = await evaluateFactWithBrowserGroq(
+                  rawFact,
+                  browserGroqKey,
+                  evaluator,
+                );
+                const formatted = formatBrowserFactResult(rawFact, factId, parsed);
+                currentIndexRef.current = globalIndex + 1;
+                syncEvaluatedFact(
+                  reportId,
+                  globalIndex,
+                  normalizeStreamFact(formatted, false),
+                  null,
+                );
+              } catch (err) {
+                const issue = toEvaluationIssue(factId, err);
+                const formatted = formatBrowserFactResult(rawFact, factId, {
+                  verdict: "NOT_SURE",
+                  issue: null,
+                  reason: issue.message,
+                  evidence_text: String(
+                    rawFact.exact_paragraph ?? rawFact.evidence_text ?? "",
+                  ),
+                });
+                currentIndexRef.current = globalIndex + 1;
+                syncEvaluatedFact(
+                  reportId,
+                  globalIndex,
+                  normalizeStreamFact(formatted, true),
+                  issue,
+                );
+              }
+
+              if (batchIndex < batches.length - 1 || i < batch.length - 1) {
+                await sleep(CLIENT_BATCH_DELAY_MS);
+              }
+            }
+          }
+
+          if (runIdRef.current !== runId) return;
+          finishActiveEvaluation("COMPLETED");
+          return;
+        }
+
+        const apiUrl = getEvaluationApiUrl();
+
         for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
           if (runIdRef.current !== runId) return;
 
@@ -109,7 +207,7 @@ export function ActiveEvaluationRunner() {
             { isWaitingForFirst: batchStartIndex === 0 && batchIndex === 0 },
           );
 
-          const response = await fetch("/api/evaluate", {
+          const response = await fetch(apiUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             signal: controller.signal,

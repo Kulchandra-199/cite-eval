@@ -1,5 +1,5 @@
-/** Facts sent per /api/evaluate request from the client. */
-export const CLIENT_BATCH_SIZE = 10;
+/** Facts sent per /api/evaluate request from the client. Keep small for Vercel serverless timeouts. */
+export const CLIENT_BATCH_SIZE = 2;
 
 /** Max parallel Groq calls within one server batch. */
 export const SERVER_BATCH_CONCURRENCY = 2;

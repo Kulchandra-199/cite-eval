@@ -5,6 +5,11 @@ import { getEvaluatorLabel } from "@/lib/evaluators";
 import { readEvaluationStream } from "@/lib/evaluation-client";
 import { normalizeStreamFact } from "@/lib/report-utils";
 import { useReports } from "@/context/ReportsContext";
+import {
+  chunkArray,
+  CLIENT_BATCH_SIZE,
+  EvaluationStreamEvent,
+} from "@/lib/evaluation-config";
 
 /** Runs Groq streaming in the background so evaluation survives page navigation. */
 export function ActiveEvaluationRunner() {
@@ -70,79 +75,109 @@ export function ActiveEvaluationRunner() {
       });
     }
 
+    const batches = chunkArray(remaining, CLIENT_BATCH_SIZE);
+
     (async () => {
       try {
-        const response = await fetch("/api/evaluate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: controller.signal,
-          body: JSON.stringify({ evaluator, facts: remaining, stream: true }),
-        });
+        for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+          if (runIdRef.current !== runId) return;
 
-        if (runIdRef.current !== runId) return;
+          const batch = batches[batchIndex];
+          const batchStartIndex =
+            fromIndex +
+            batches
+              .slice(0, batchIndex)
+              .reduce((sum, chunk) => sum + chunk.length, 0);
 
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          const message =
-            typeof data.error === "string"
-              ? data.error
-              : data.error?.message ||
-                `Server returned error status ${response.status}.`;
-          failActiveEvaluation(message);
-          return;
+          const response = await fetch("/api/evaluate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: controller.signal,
+            body: JSON.stringify({ evaluator, facts: batch, stream: true }),
+          });
+
+          if (runIdRef.current !== runId) return;
+
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            const message =
+              typeof data.error === "string"
+                ? data.error
+                : data.error?.message ||
+                  `Server returned error status ${response.status}.`;
+            failActiveEvaluation(message);
+            return;
+          }
+
+          let batchFinished = false;
+
+          await readEvaluationStream(
+            response,
+            (event: EvaluationStreamEvent) => {
+              if (runIdRef.current !== runId) return;
+
+              if (event.type === "meta") {
+                const claimNumber = currentIndexRef.current + 1;
+                setActiveEvalStatus(
+                  `Groq connected — verifying claim ${Math.min(claimNumber, inputFacts.length)} of ${inputFacts.length}...`,
+                  { isWaitingForFirst: false },
+                );
+                if (
+                  event.provider === "groq" &&
+                  fromIndex === 0 &&
+                  batchIndex === 0
+                ) {
+                  appendEvalLog({
+                    id: "groq-active",
+                    type: "info",
+                    text: "Groq connected — open the report anytime to review finished claims.",
+                  });
+                }
+                return;
+              }
+
+              if (event.type === "fatal") {
+                failActiveEvaluation(event.error.message);
+                return;
+              }
+
+              if (event.type === "fact") {
+                const globalIndex = batchStartIndex + event.index;
+                const normalized = normalizeStreamFact(
+                  event.fact,
+                  Boolean(event.error),
+                );
+                currentIndexRef.current = globalIndex + 1;
+                syncEvaluatedFact(reportId, globalIndex, normalized, event.error);
+                return;
+              }
+
+              if (event.type === "done") {
+                batchFinished = true;
+              }
+            },
+            controller.signal,
+          );
+
+          if (runIdRef.current !== runId) return;
+
+          if (!batchFinished) {
+            pauseActiveEvaluation(currentIndexRef.current);
+            appendEvalLog({
+              id: `batch-interrupted-${batchStartIndex}`,
+              type: "info",
+              text: `Connection interrupted after ${currentIndexRef.current} / ${inputFacts.length} claims. Resume to continue.`,
+            });
+            return;
+          }
         }
 
-        let streamFinished = false;
-
-        await readEvaluationStream(
-          response,
-          (event) => {
-            if (runIdRef.current !== runId) return;
-
-            if (event.type === "meta") {
-              setActiveEvalStatus(
-                fromIndex === 0
-                  ? `Groq connected — verifying claim 1 of ${inputFacts.length}...`
-                  : `Groq connected — verifying claim ${fromIndex + 1} of ${inputFacts.length}...`,
-                { isWaitingForFirst: false },
-              );
-              if (event.provider === "groq" && fromIndex === 0) {
-                appendEvalLog({
-                  id: "groq-active",
-                  type: "info",
-                  text: "Groq connected — open the report anytime to review finished claims.",
-                });
-              }
-              return;
-            }
-
-            if (event.type === "fatal") {
-              failActiveEvaluation(event.error.message);
-              return;
-            }
-
-            if (event.type === "fact") {
-              const globalIndex = fromIndex + event.index;
-              const normalized = normalizeStreamFact(
-                event.fact,
-                Boolean(event.error),
-              );
-              currentIndexRef.current = globalIndex + 1;
-              syncEvaluatedFact(reportId, globalIndex, normalized, event.error);
-              return;
-            }
-
-            if (event.type === "done") {
-              streamFinished = true;
-            }
-          },
-          controller.signal,
-        );
-
         if (runIdRef.current !== runId) return;
 
-        if (streamFinished) {
+        if (currentIndexRef.current >= inputFacts.length) {
           finishActiveEvaluation("COMPLETED");
+        } else {
+          pauseActiveEvaluation(currentIndexRef.current);
         }
       } catch (err: unknown) {
         if (runIdRef.current !== runId) return;

@@ -3,6 +3,9 @@ import { evaluateFacts, evaluateFactsStream } from "@/lib/evaluator";
 import { formatErrorForClient } from "@/lib/api-errors";
 import { normalizeEvaluatorId } from "@/lib/evaluators";
 
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
+
 function isAbortError(error: unknown): boolean {
   return (
     (error instanceof DOMException && error.name === "AbortError") ||
@@ -114,6 +117,8 @@ export async function POST(request: Request) {
         headers: {
           "Content-Type": "application/x-ndjson; charset=utf-8",
           "Cache-Control": "no-cache, no-transform",
+          "Connection": "keep-alive",
+          "X-Accel-Buffering": "no",
         },
       });
     }

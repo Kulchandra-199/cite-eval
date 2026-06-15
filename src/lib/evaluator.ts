@@ -5,8 +5,19 @@ import {
   getGroqClient,
   normalizeGroqIssue,
 } from "@/lib/groq";
+import { EvaluationIssue, toEvaluationIssue } from "@/lib/api-errors";
+import { EvaluationStreamEvent, SERVER_BATCH_CONCURRENCY } from "@/lib/evaluation-config";
 import { EvaluatorModelId, VerdictType } from "@/lib/types";
 import { DEFAULT_EVALUATOR } from "@/lib/evaluators";
+
+export interface EvaluationBatchResult {
+  facts: ReturnType<typeof formatResult>[];
+  usingFallback: boolean;
+  provider: "groq" | "gemini" | "offline";
+  errors: EvaluationIssue[];
+}
+
+export type { EvaluationStreamEvent } from "@/lib/evaluation-config";
 
 function normalizeVerdict(verdict: string | undefined): VerdictType {
   if (verdict === "PASS" || verdict === "FAIL" || verdict === "NOT_SURE") {
@@ -313,63 +324,180 @@ async function evaluateWithProvider(
   fact: any,
   index: number,
   evaluator: EvaluatorModelId = DEFAULT_EVALUATOR,
-) {
+): Promise<{
+  fact: ReturnType<typeof formatResult>;
+  error?: EvaluationIssue;
+  usedFallback: boolean;
+}> {
   const factId = fact.fact_id || fact.id || `F${index + 1}`;
+  const activeProvider = getActiveProvider();
 
   if (getGroqClient()) {
     try {
       const parsed = await evaluateWithGroq(fact, evaluator);
-      if (parsed) {
-        return formatResult(fact, factId, {
+      return {
+        fact: formatResult(fact, factId, {
           verdict: normalizeVerdict(parsed.verdict),
           issue: normalizeGroqIssue(parsed.issue),
           reason: parsed.reason || "Evaluation completed.",
           evidence_text:
             parsed.evidence_text || fact.exact_paragraph || "Segment evaluated.",
           review_status: "PENDING",
-        });
-      }
+        }),
+        usedFallback: false,
+      };
     } catch (err) {
       console.warn(`Groq evaluation failed for ${factId}:`, err);
+      const issue = toEvaluationIssue(factId, err);
+
+      if (activeProvider === "groq") {
+        return {
+          fact: formatResult(fact, factId, {
+            verdict: "NOT_SURE",
+            issue: null,
+            reason: issue.message,
+            evidence_text:
+              fact.exact_paragraph || fact.evidence_text || "Evaluation unavailable.",
+            review_status: "PENDING",
+          }),
+          error: issue,
+          usedFallback: false,
+        };
+      }
     }
   }
 
   if (getGeminiClient()) {
-    return evaluateWithGemini(fact, index);
+    try {
+      const result = await evaluateWithGemini(fact, index);
+      return { fact: result, usedFallback: false };
+    } catch (err) {
+      console.warn(`Gemini evaluation failed for ${factId}:`, err);
+      const issue = toEvaluationIssue(factId, err);
+
+      if (activeProvider === "gemini") {
+        return {
+          fact: formatResult(fact, factId, {
+            verdict: "NOT_SURE",
+            issue: null,
+            reason: issue.message,
+            evidence_text:
+              fact.exact_paragraph || fact.evidence_text || "Evaluation unavailable.",
+            review_status: "PENDING",
+          }),
+          error: issue,
+          usedFallback: false,
+        };
+      }
+    }
   }
 
-  return evaluateFactLocal(fact, index);
+  return {
+    fact: evaluateFactLocal(fact, index),
+    usedFallback: true,
+  };
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const current = nextIndex++;
+      results[current] = await mapper(items[current], current);
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    () => worker(),
+  );
+  await Promise.all(workers);
+  return results;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export async function evaluateFacts(
   facts: any[],
   evaluator: EvaluatorModelId = DEFAULT_EVALUATOR,
-) {
+): Promise<EvaluationBatchResult> {
   const provider = getActiveProvider();
 
   if (provider === "offline") {
     return {
       facts: facts.map((f, i) => evaluateFactLocal(f, i)),
       usingFallback: true,
-      provider: "offline" as const,
+      provider: "offline",
+      errors: [],
     };
   }
 
-  const results = [];
-  for (let i = 0; i < facts.length; i += 3) {
-    const chunk = facts.slice(i, i + 3);
-    const chunkResults = await Promise.all(
-      chunk.map((fact, idx) => evaluateWithProvider(fact, i + idx, evaluator)),
-    );
-    results.push(...chunkResults);
+  const concurrency =
+    provider === "groq" ? SERVER_BATCH_CONCURRENCY : Math.min(3, facts.length);
+
+  const batchResults = await mapWithConcurrency(
+    facts,
+    concurrency,
+    (fact, index) => evaluateWithProvider(fact, index, evaluator),
+  );
+
+  const results: ReturnType<typeof formatResult>[] = [];
+  const errors: EvaluationIssue[] = [];
+  let usedFallback = false;
+
+  for (const { fact, error, usedFallback: factFallback } of batchResults) {
+    results.push(fact);
+    if (error) errors.push(error);
+    if (factFallback) usedFallback = true;
   }
 
   return {
     facts: results,
-    usingFallback: false,
+    usingFallback: usedFallback,
     provider,
+    errors,
   };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function* evaluateFactsStream(
+  facts: any[],
+  evaluator: EvaluatorModelId = DEFAULT_EVALUATOR,
+): AsyncGenerator<EvaluationStreamEvent> {
+  const provider = getActiveProvider();
+
+  yield { type: "meta", provider, total: facts.length };
+
+  const errors: EvaluationIssue[] = [];
+  let usedFallback = false;
+
+  if (provider === "offline") {
+    for (let i = 0; i < facts.length; i++) {
+      const fact = evaluateFactLocal(facts[i], i);
+      yield { type: "fact", index: i, fact, error: null };
+    }
+    yield { type: "done", usingFallback: true, provider, errors };
+    return;
+  }
+
+  // Sequential streaming: first result arrives after a single Groq call (~1–2s).
+  for (let i = 0; i < facts.length; i++) {
+    const { fact, error, usedFallback: factFallback } = await evaluateWithProvider(
+      facts[i],
+      i,
+      evaluator,
+    );
+    if (error) errors.push(error);
+    if (factFallback) usedFallback = true;
+    yield { type: "fact", index: i, fact, error: error ?? null };
+  }
+
+  yield { type: "done", usingFallback: usedFallback, provider, errors };
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -384,16 +512,23 @@ export async function evaluateSingleFact(
       fact: evaluateFactLocal(fact, 0),
       usingFallback: true,
       provider: "offline" as const,
+      errors: [] as EvaluationIssue[],
     };
   }
 
-  const result = await evaluateWithProvider(fact, 0, evaluator);
+  const { fact: result, error, usedFallback } = await evaluateWithProvider(
+    fact,
+    0,
+    evaluator,
+  );
+
   return {
     fact: {
       ...result,
       review_status: result.verdict === "PASS" ? "REVIEWED" : "PENDING",
     },
-    usingFallback: false,
+    usingFallback: usedFallback,
     provider,
+    errors: error ? [error] : [],
   };
 }

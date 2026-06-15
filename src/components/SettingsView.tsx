@@ -71,12 +71,26 @@ export default function SettingsView({
       const latency = Date.now() - start;
 
       if (!response.ok) {
-        throw new Error(`Endpoint returned status ${response.status}`);
+        const payload = await response.json().catch(() => ({}));
+        const message =
+          typeof payload.error === "string"
+            ? payload.error
+            : payload.error?.message ||
+              payload.errors?.[0]?.message ||
+              `Endpoint returned status ${response.status}`;
+        throw new Error(message);
       }
 
       const data = await response.json();
       const fallback = data.usingFallback;
       const provider = data.provider as string | undefined;
+      const apiErrors = data.errors as { message: string }[] | undefined;
+
+      if (apiErrors?.length) {
+        setApiStatus('FAILED');
+        setApiNotes(`Connected in ${latency}ms, but evaluation error: ${apiErrors[0].message}`);
+        return;
+      }
 
       if (fallback) {
         setApiStatus('LIVE_OFFLINE');

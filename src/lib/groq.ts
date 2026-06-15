@@ -1,6 +1,10 @@
 import OpenAI from "openai";
+import { parseProviderError } from "@/lib/api-errors";
+import { GROQ_MIN_INTERVAL_MS } from "@/lib/evaluation-config";
 import { EvaluatorModelId } from "@/lib/types";
 import { DEFAULT_EVALUATOR } from "@/lib/evaluators";
+
+const MAX_RETRIES = 4;
 
 const EVALUATION_SCHEMA = {
   type: "object",
@@ -47,6 +51,30 @@ Respond with a single JSON object only (no markdown), using exactly this shape:
 Use PASS when fully supported, FAIL when clearly wrong, NOT_SURE when evidence is insufficient. Use issue "NONE" when verdict is PASS or NOT_SURE.`;
 
 let groqClient: OpenAI | null = null;
+let groqQueue: Promise<void> = Promise.resolve();
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Serialize Groq calls with spacing to respect RPM limits. */
+async function runThroughGroqQueue<T>(fn: () => Promise<T>): Promise<T> {
+  let release!: () => void;
+  const slot = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  const previous = groqQueue;
+  groqQueue = previous.then(() => slot);
+
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    groqQueue = groqQueue.then(() => sleep(GROQ_MIN_INTERVAL_MS)).then(() => undefined);
+  }
+}
 
 export function getGroqClient(): OpenAI | null {
   if (groqClient) return groqClient;
@@ -108,33 +136,63 @@ export async function evaluateWithGroq(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   fact: any,
   model: EvaluatorModelId = DEFAULT_EVALUATOR,
-): Promise<GroqEvaluationResult | null> {
+): Promise<GroqEvaluationResult> {
   const client = getGroqClient();
-  if (!client) return null;
+  if (!client) {
+    throw parseProviderError(new Error("GROQ_API_KEY is not configured."));
+  }
 
   const usesJsonObject =
     !JSON_SCHEMA_STRICT_MODELS.has(model) &&
     !JSON_SCHEMA_BEST_EFFORT_MODELS.has(model);
 
-  const response = await client.chat.completions.create({
-    model,
-    temperature: 0,
-    messages: [
-      {
-        role: "system",
-        content: usesJsonObject
-          ? JSON_OBJECT_SYSTEM_PROMPT
-          : "You are a professional citation verification engine. Compare extracted claims against ground-truth source text. Return only schema-valid JSON.",
-      },
-      { role: "user", content: buildEvaluationPrompt(fact) },
-    ],
-    response_format: buildResponseFormat(model),
-  });
+  let lastError: unknown;
 
-  const content = response.choices[0]?.message?.content;
-  if (!content) return null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await runThroughGroqQueue(async () => {
+        const response = await client.chat.completions.create({
+          model,
+          temperature: 0,
+          messages: [
+            {
+              role: "system",
+              content: usesJsonObject
+                ? JSON_OBJECT_SYSTEM_PROMPT
+                : "You are a professional citation verification engine. Compare extracted claims against ground-truth source text. Return only schema-valid JSON.",
+            },
+            { role: "user", content: buildEvaluationPrompt(fact) },
+          ],
+          response_format: buildResponseFormat(model),
+        });
 
-  return JSON.parse(content) as GroqEvaluationResult;
+        const content = response.choices[0]?.message?.content;
+        if (!content) {
+          throw new Error("Groq returned an empty response.");
+        }
+
+        try {
+          return JSON.parse(content) as GroqEvaluationResult;
+        } catch {
+          throw new Error("Groq returned invalid JSON.");
+        }
+      });
+    } catch (err) {
+      lastError = err;
+      const parsed = parseProviderError(err);
+
+      if (parsed.code === "rate_limit" && attempt < MAX_RETRIES) {
+        const waitMs =
+          (parsed.retryAfterSeconds ?? 2) * 1000 + attempt * 500;
+        await sleep(waitMs);
+        continue;
+      }
+
+      throw parsed;
+    }
+  }
+
+  throw parseProviderError(lastError);
 }
 
 export function normalizeGroqIssue(issue: string | null): string | null {

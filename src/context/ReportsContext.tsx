@@ -253,11 +253,26 @@ export function ReportsProvider({ children }: { children: React.ReactNode }) {
         body: JSON.stringify({ fact, evaluator: report.evaluator }),
       });
 
+      const data = await response.json();
+
       if (!response.ok) {
-        throw new Error(`Server returned error status ${response.status}`);
+        const message =
+          typeof data.error === "string"
+            ? data.error
+            : data.error?.message ||
+              data.errors?.[0]?.message ||
+              `Server returned error status ${response.status}`;
+        alert(`Re-evaluation failed for [${factId}]:\n\n${message}`);
+        return;
       }
 
-      const data = await response.json();
+      if (data.errors?.length > 0) {
+        alert(
+          `Re-evaluation failed for [${factId}]:\n\n${data.errors[0].message}`,
+        );
+        return;
+      }
+
       const nextFact = data.fact;
 
       handleUpdateFact(reportId, factId, {
